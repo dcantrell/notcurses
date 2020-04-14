@@ -74,6 +74,7 @@ python setup.py install --root=%{buildroot} --optimize=1
 %{_bindir}/notcurses-input
 %{_bindir}/notcurses-ncreel
 %{_bindir}/notcurses-tetris
+# Don't wildcard all .1, or we'll pick up notcurses-pydemo
 %{_mandir}/man1/notcurses-demo.1*
 %{_mandir}/man1/notcurses-input.1*
 %{_mandir}/man1/notcurses-ncreel.1*
