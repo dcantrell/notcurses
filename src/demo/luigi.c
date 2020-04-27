@@ -114,7 +114,7 @@ draw_luigi(struct ncplane* n, const char* sprite){
   uint64_t channels = 0;
   channels_set_fg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
   channels_set_bg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
-  ncplane_set_base(n, channels, 0, "");
+  ncplane_set_base(n, "", 0, channels);
   size_t s;
   int sbytes;
   // optimization so we can elide more color changes, see README's "#perf"
@@ -148,23 +148,20 @@ int luigi_demo(struct notcurses* nc){
   }
   int rows, cols;
   struct ncplane* n = notcurses_stddim_yx(nc, &rows, &cols);
-  int averr = 0;
+  nc_err_e ncerr = NCERR_SUCCESS;
   char* map = find_data("megaman2.bmp");
-  struct ncvisual* nv = ncplane_visual_open(n, map, &averr);
+  struct ncvisual* nv = ncplane_visual_open(n, map, &ncerr);
   free(map);
   if(nv == NULL){
     return -1;
   }
-  if(ncvisual_decode(nv, &averr) == NULL){
+  if((ncerr = ncvisual_decode(nv)) != NCERR_SUCCESS){
     return -1;
   }
   if(ncvisual_render(nv, 0, 0, -1, -1) <= 0){
     return -1;
   }
-  assert(ncvisual_decode(nv, &averr) == NULL);
-#ifdef USE_FFMPEG
-  assert(averr == AVERROR_EOF);
-#endif
+  assert(NCERR_EOF == ncvisual_decode(nv));
   // he should be walking on the platform ~4/5 of the way down
   const int height = 32;
   int yoff = rows * 4 / 5 - height + 1; // tuned
@@ -190,19 +187,19 @@ int luigi_demo(struct notcurses* nc){
   if(fname == NULL){
     return -1;
   }
-  wmncv = ncvisual_open_plane(nc, fname, &averr, 0, 0, NCSCALE_NONE);
+  wmncv = ncvisual_open_plane(nc, fname, &ncerr, 0, 0, NCSCALE_NONE);
   free(fname);
   if(wmncv == NULL){
     return -1;
   }
-  if(ncvisual_decode(wmncv, &averr) == NULL){
+  if((ncerr = ncvisual_decode(wmncv)) != NCERR_SUCCESS){
     ncvisual_destroy(wmncv);
     return -1;
   }
   uint64_t channels = 0;
   channels_set_fg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
   channels_set_bg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
-  ncplane_set_base(ncvisual_plane(wmncv), channels, 0, "");
+  ncplane_set_base(ncvisual_plane(wmncv), "", 0, channels);
   if(ncvisual_render(wmncv, 0, 0, -1, -1) <= 0){
     ncvisual_destroy(wmncv);
     return -1;
@@ -219,7 +216,7 @@ int luigi_demo(struct notcurses* nc){
     int dimy = ncplane_dim_y(ncvisual_plane(wmncv));
     ncplane_move_yx(ncvisual_plane(wmncv), rows * 4 / 5 - dimy + 1 + (i % 2), i - 60);
     DEMO_RENDER(nc);
-    nanosleep(&stepdelay, NULL);
+    demo_nanosleep(nc, &stepdelay);
   }
   for(i = 0 ; i < 3 ; ++i){
     ncplane_destroy(lns[i]);

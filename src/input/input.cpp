@@ -9,8 +9,8 @@
 #include <clocale>
 #include <iostream>
 #include <termios.h>
-#include <ncpp/NotCurses.hh>
 #include <ncpp/Plane.hh>
+#include <ncpp/NotCurses.hh>
 
 #define NANOSECS_IN_SEC 1000000000
 
@@ -29,7 +29,7 @@ std::mutex mtx;
 uint64_t start;
 static int dimy, dimx;
 std::atomic<bool> done;
-static struct ncplot* plot;
+static struct ncuplot* plot;
 
 // return the string version of a special composed key
 const char* nckeystr(char32_t spkey){
@@ -187,10 +187,10 @@ dim_rows(const Plane* n){
 
 void Tick(ncpp::NotCurses* nc, uint64_t sec) {
   const std::lock_guard<std::mutex> lock(mtx);
-  if(ncplot_add_sample(plot, sec, 0)){
+  if(ncuplot_add_sample(plot, sec, 0)){
     throw std::runtime_error("couldn't register timetick");
   }
-  if(nc->render()){
+  if(!nc->render()){
     throw std::runtime_error("error rendering");
   }
 }
@@ -220,7 +220,7 @@ int main(void){
   channels_set_fg_rgb(&popts.minchannel, 0x40, 0x50, 0xb0);
   channels_set_fg_rgb(&popts.maxchannel, 0x40, 0xff, 0xd0);
   popts.gridtype = static_cast<ncgridgeom_e>(NCPLOT_2x2);
-  plot = ncplot_create(pplane, &popts);
+  plot = ncuplot_create(pplane, &popts, 0, 0);
   if(!plot){
     return EXIT_FAILURE;
   }
@@ -232,7 +232,7 @@ int main(void){
   }
   n->styles_set(CellStyle::None);
   n->set_bg_default();
-  if(nc.render()){
+  if(!nc.render()){
     throw std::runtime_error("error rendering");
   }
   int y = 2;
@@ -295,11 +295,11 @@ int main(void){
     }
     const uint64_t sec = (timenow_to_ns() - start) / NANOSECS_IN_SEC;
     mtx.lock();
-    if(ncplot_add_sample(plot, sec, 1)){
+    if(ncuplot_add_sample(plot, sec, 1)){
       mtx.unlock();
       break;
     }
-    if(nc.render()){
+    if(!nc.render()){
       mtx.unlock();
       throw std::runtime_error("error rendering");
     }

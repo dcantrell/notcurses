@@ -1,6 +1,6 @@
 % notcurses_stats(3)
 % nick black <nickblack@linux.com>
-% v1.3.0
+% v1.3.3
 
 # NAME
 
@@ -8,7 +8,7 @@ notcurses_stats - notcurses runtime statistics
 
 # SYNOPSIS
 
-**#include <notcurses.h>**
+**#include <notcurses/notcurses.h>**
 
 ```c
 typedef struct ncstats {

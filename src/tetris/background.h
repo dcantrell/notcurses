@@ -1,12 +1,12 @@
 void DrawBackground(const std::string& s) { // drawn to the standard plane
-#ifdef USE_FFMPEG
-  int averr;
+#ifdef USE_MULTIMEDIA
+  nc_err_e err;
   try{
-    backg_ = std::make_unique<ncpp::Visual>(s.c_str(), &averr, 0, 0, ncpp::NCScale::Stretch);
+    backg_ = std::make_unique<ncpp::Visual>(s.c_str(), &err, 0, 0, ncpp::NCScale::Stretch);
   }catch(std::exception& e){
     throw TetrisNotcursesErr("visual(): " + s + ": " + e.what());
   }
-  if(!backg_->decode(&averr)){
+  if(backg_->decode() != NCERR_SUCCESS){
     throw TetrisNotcursesErr("decode(): " + s);
   }
   if(backg_->render(0, 0, -1, -1) <= 0){
@@ -36,7 +36,7 @@ void DrawBoard() { // draw all fixed components of the game
     throw TetrisNotcursesErr("double_box()");
   }
   channels_set_fg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
-  board_->set_base(channels, 0, "");
+  board_->set_base("", 0, channels);
   scoreplane_ = std::make_unique<ncpp::Plane>(2, 30, y - BOARD_HEIGHT, 2, nullptr);
   if(!scoreplane_){
     throw TetrisNotcursesErr("Plane()");
@@ -44,7 +44,7 @@ void DrawBoard() { // draw all fixed components of the game
   uint64_t scorechan = 0;
   channels_set_bg_alpha(&scorechan, CELL_ALPHA_TRANSPARENT);
   channels_set_fg_alpha(&scorechan, CELL_ALPHA_TRANSPARENT);
-  if(!scoreplane_->set_base(scorechan, 0, "")){
+  if(!scoreplane_->set_base("", 0, scorechan)){
     throw TetrisNotcursesErr("set_base()");
   }
   scoreplane_->set_bg_alpha(CELL_ALPHA_TRANSPARENT);
@@ -52,7 +52,7 @@ void DrawBoard() { // draw all fixed components of the game
   scoreplane_->printf(0, 1, "%s", cuserid(nullptr));
   scoreplane_->set_fg(0x00d0a0);
   UpdateScore();
-  if(nc_.render()){
+  if(!nc_.render()){
     throw TetrisNotcursesErr("render()");
   }
 }

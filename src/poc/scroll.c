@@ -8,12 +8,12 @@ int main(void){
   if(nc == NULL){
     return EXIT_FAILURE;
   }
-  int dimy, dimx, y, x;
+  int dimy, dimx;
   struct ncplane* n = notcurses_stddim_yx(nc, &dimy, &dimx);
   char c = 'A';
   ncplane_set_scrolling(n, true);
   while(true){
-    struct timespec req = { .tv_sec = 0, .tv_nsec = 10000000, };
+    struct timespec req = { .tv_sec = 0, .tv_nsec = 1000000, };
     nanosleep(&req, NULL);
     if(ncplane_putsimple(n, c) != 1){
       break;

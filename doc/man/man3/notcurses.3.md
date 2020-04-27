@@ -1,6 +1,6 @@
 % notcurses(3)
 % nick black <nickblack@linux.com>
-% v1.3.0
+% v1.3.3
 
 # NAME
 
@@ -8,7 +8,7 @@ notcurses - TUI library for modern terminal emulators
 
 # SYNOPSIS
 
-**#include <notcurses.h>**
+**#include <notcurses/notcurses.h>**
 
 **-lnotcurses**
 
@@ -36,7 +36,8 @@ Before calling into notcurses—and usually as one of the first calls of the
 program—be sure to call **setlocale** with an appropriate UTF-8 **LC_ALL**
 locale. It is usually appropriate to use **setlocale(LC_ALL, "")**, relying on
 the user to properly set the **LANG** environment variable. notcurses will
-refuse to start if **nl_langinfo(3)** doesn't indicate UTF-8.
+refuse to start if **nl_langinfo(3)** doesn't indicate UTF-8 or ANSI_X3.4-1968
+(aka US-ASCII). Be aware that capabilities are substantially reduced in ASCII.
 
 **notcurses_init(3)** accepts a **struct notcurses_options** allowing fine-grained
 control of notcurses behavior, including signal handlers, alternative screens,
@@ -75,7 +76,7 @@ ncplanes, and new ncplanes are placed at the top of the z-buffer. Ncplanes can
 be larger, smaller, or the same size as the physical screen, and can be placed
 anywhere relative to it (including entirely off-screen). Ncplanes are made up
 of cells (see [Cells][] below). Information on ncplanes is available at
-**notcurses_ncplane(3)**.
+**notcurses_plane(3)**.
 
 ## Cells
 
@@ -135,15 +136,15 @@ previous action.
 **notcurses-demo(1)**,
 **notcurses-input(1)**,
 **notcurses_cell(3)**, **notcurses_channels(3)**,
-**notcurses_fade(3)**, **notcurses_init(3)**, **notcurses_input(3)**,
 **notcurses_directmode(3)**,
+**notcurses_error(3)**,
+**notcurses_fade(3)**, **notcurses_init(3)**, **notcurses_input(3)**,
 **notcurses_lines(3)**,
 **notcurses_menu(3)**,
 **notcurses_multiselector(3)**,
-**notcurses_ncplane(3)**,
-**notcurses_ncvisual(3)**,
 **notcurses_output(3)**,
 **notcurses_palette(3)**,
+**notcurses_plane(3)**,
 **notcurses_plot(3)**,
 **notcurses_reel(3)**,
 **notcurses_refresh(3)**,
@@ -151,5 +152,6 @@ previous action.
 **notcurses_selector(3)**,
 **notcurses_stats(3)**,
 **notcurses_stdplane(3)**, **notcurses_stop(3)**,
+**notcurses_visual(3)**,
 **terminfo(5)**, **ascii(7)**, **utf-8(7)**,
 **unicode(7)**

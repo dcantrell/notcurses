@@ -1,19 +1,61 @@
 This document attempts to list user-visible changes and any major internal
 rearrangements of Notcurses.
 
-* 1.3.1
-  * The C++ `Notcurses::render()` function now returns non-zero on failure,
-  mirroring the behavior of the core C `notcurses_render()`. This is an
-  inversion of its previous behavior.
+* 1.3.3 (2020-04-26)
+  * The `ncdplot` type has been added for plots based on `double`s rather than
+    `uint64_t`s. The `ncplot` type and all `ncplot_*` functions were renamed
+    `ncuplot` for symmetry.
+  * FFMpeg types are no longer leaked through the Notcurses API. `AVERROR`
+    is no longer applicable, and `ncvisual_decode()` no longer returns a
+    `struct AVframe*`. Instead, the `nc_err_e` enumeration has been introduced.
+    Functions which once accepted a value-result `AVERROR` now accept a value-
+    result `nc_err_e`. The relevant constants can be found in
+    `notcurses/ncerrs.h`.
+  * OpenImageIO 2.1+ is now supported as an experimental multimedia backend.
+    FFmpeg remains recommended. Video support with OIIO is spotty thus far.
+  * CMake no longer uses the `USE_FFMPEG` option. Instead, the `USE_MULTIMEDIA`
+    option can be defined as `ffmpeg`, `oiio`, or `none`. In `cmake-gui`, this
+    item will now appear as an option selector. `oiio` selects OpenImageIO.
 
-* 1.2.8
+* 1.3.2 (2020-04-19)
+  * `ncdirect_cursor_push()`, `notcurses_cursor_pop()`, and
+    `ncdirect_cursor_yx()` have been added. These are not supported on all
+    terminals. `ncdirect_cursor_yx()` ought be considered experimental; it
+    must read a response from the terminal, and this can interact poorly with
+    other uses of standard input.
+  * 1.3.1 unintentionally inverted the C++ `Notcurses::render()` wrapper's
+    return code. The previous semantics have been restored.
+
+* 1.3.1 (2020-04-18)
+  * `ncplane_at_yx()` and `ncplane_at_cursor()` have been changed to return a
+    heap-allocated EGC, and write the attributes and channels to value-result
+    `uint32_t*` and `uint64_t*` parameters, instead of to a `cell*`. This
+    matches `notcurses_at_yx()`, and means they're no longer invalidated if the
+    plane in question is destroyed. The previous functionality is available as
+    new functions `ncplane_at_yx_cell()` and `ncplane_at_cursor_cell()`.
+  * `ncplane_set_base()` inverted its `uint32_t attrword` and `uint64_t channels`
+    parameters, thus matching every other function with these two parameters.
+    It moved `const char* egc` before either, to force a type error, as the
+    change would otherwise be likely to go overlooked.
+  * Scrolling is now completely implemented. When a plane has scrolling enabled
+    through use of `ncplane_set_scrolling(true)`, output past the end of the
+    last line will now result in the top line of the plane being lost, all
+    other lines moved up one, and the bottom line cleared.
+
+* 1.3.0 (2020-04-12)
+  * No user-visible changes
+
+* 1.2.9 (2020-04-11)
+  * No user-visible changes
+
+* 1.2.8 (2020-04-10)
   * `notcurses-tetris` now happily continues if it can't load its background.
 
-* 1.2.7
+* 1.2.7 (2020-04-10)
   * Plots now always keep the most recent data to their far right (i.e., the
     gap that is initially filled is on the left, rather than the right).
 
-* 1.2.6
+* 1.2.6 (2020-04-08)
   * `ncplane_putsimple_yx()` and `ncplane_putstr_yx()` have been exported as
     static inline functions.
   * `ncplane_set_scrolling()` has been added, allowing control over whether a
@@ -35,7 +77,7 @@ rearrangements of Notcurses.
     `notcurses_resize()` internally, as `notcurses_render()` always has).
   * First Fedora packaging.
 
-* 1.2.5
+* 1.2.5 (2020-04-05)
   * Add ncplot, with support for sliding-windowed horizontal histograms.
   * gradient, polyfill, `ncplane_format()` and `ncplane_stain()` all now return
     the number of cells written on success. Failure still sees -1 returned.
@@ -51,6 +93,6 @@ rearrangements of Notcurses.
     and a source of blunders. The EGC is returned via the `char*` return
     value. https://github.com/dankamongmen/notcurses/issues/410
 
-* 1.2.4 2020-03-24
+* 1.2.4 (2020-03-24)
   * Add ncmultiselector
   * Add `ncdirect_cursor_enable()` and `ncdirect_cursor_disable()`.

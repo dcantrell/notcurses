@@ -1,6 +1,6 @@
 % notcurses_cell(3)
 % nick black <nickblack@linux.com>
-% v1.3.0
+% v1.3.3
 
 # NAME
 
@@ -8,7 +8,7 @@ notcurses_cell - operations on notcurses cells
 
 # SYNOPSIS
 
-**#include <notcurses.h>**
+**#include <notcurses/notcurses.h>**
 
 ```c
 // See DESCRIPTION below for information on EGC encoding

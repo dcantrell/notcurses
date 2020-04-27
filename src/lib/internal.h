@@ -1,6 +1,10 @@
 #ifndef NOTCURSES_INTERNAL
 #define NOTCURSES_INTERNAL
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include "version.h"
 
 #ifdef USE_FFMPEG
@@ -14,6 +18,10 @@
 #include <libswscale/version.h>
 #include <libavformat/version.h>
 #include <libavformat/avformat.h>
+#else
+#ifdef USE_OIIO
+const char* oiio_version(void);
+#endif
 #endif
 
 #include <term.h>
@@ -25,20 +33,11 @@
 #include <string.h>
 #include <signal.h>
 #include <wctype.h>
+#include <termios.h>
 #include <stdbool.h>
 #include "notcurses/notcurses.h"
 #include "egcpool.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-struct AVFormatContext;
-struct AVCodecContext;
-struct AVFrame;
-struct AVCodec;
-struct AVCodecParameters;
-struct AVPacket;
 struct SwsContext;
 struct esctrie;
 
@@ -79,34 +78,6 @@ typedef struct ncplane {
   struct notcurses* nc; // notcurses object of which we are a part
   bool scrolling;       // is scrolling enabled? always disabled by default
 } ncplane;
-
-typedef struct ncvisual {
-  struct AVFormatContext* fmtctx;
-  struct AVCodecContext* codecctx;       // video codec context
-  struct AVCodecContext* subtcodecctx;   // subtitle codec context
-  struct AVFrame* frame;
-  struct AVFrame* oframe;
-  struct AVCodec* codec;
-  struct AVCodecParameters* cparams;
-  struct AVCodec* subtcodec;
-  struct AVPacket* packet;
-  struct SwsContext* swsctx;
-  int packet_outstanding;
-  int dstwidth, dstheight;
-  int stream_index;        // match against this following av_read_frame()
-  int sub_stream_index;    // subtitle stream index, can be < 0 if no subtitles
-  float timescale;         // scale frame duration by this value
-  ncplane* ncp;
-  // if we're creating the plane based off the first frame's dimensions, these
-  // describe where the plane ought be placed, and how it ought be sized. this
-  // path sets ncobj. ncvisual_destroy() ought in that case kill the ncplane.
-  int placex, placey;
-  ncscale_e style;         // none, scale, or stretch
-  struct notcurses* ncobj; // set iff this ncvisual "owns" its ncplane
-#ifdef USE_FFMPEG
-  AVSubtitle subtitle;
-#endif
-} ncvisual;
 
 // current presentation state of the terminal. it is carried across render
 // instances. initialize everything to 0 on a terminal reset / startup.
@@ -160,32 +131,22 @@ typedef struct ncmenu_int_section {
   int shortcut_offset;    // column offset within name of shortcut EGC
 } ncmenu_int_section;
 
-typedef struct ncplot {
-  ncplane* ncp;
-  uint64_t maxchannel;
-  uint64_t minchannel;
-  bool vertical_indep; // not yet implemented FIXME
-  ncgridgeom_e gridtype;
-  // requested number of slots. 0 for automatically setting the number of slots
-  // to span the horizontal area. if there are more slots than there are
-  // columns, we prefer showing more recent slots to less recent. if there are
-  // fewer slots than there are columns, they prefer the left side.
-  int rangex;
-  // domain minimum and maximum. if detectdomain is true, these are
-  // progressively enlarged/shrunk to fit the sample set. if not, samples
-  // outside these bounds are counted, but the displayed range covers only this.
-  uint64_t miny, maxy;
-  // sloutcount-element circular buffer of samples. the newest one (rightmost)
-  // is at slots[slotstart]; they get older as you go back (and around).
-  // elements. slotcount is max(columns, rangex), less label room.
-  uint64_t* slots;
-  int slotcount;
-  int slotstart; // index of most recently-written slot
-  int64_t slotx; // x value corresponding to slots[slotstart] (newest x)
-  bool labelaxisd; // label dependent axis (consumes PREFIXSTRLEN columns)
-  bool exponentialy; // not yet implemented FIXME
-  bool detectdomain; // is domain detection in effect (stretch the domain)?
-} ncplot;
+typedef struct ncfdplane {
+  ncfdplane_callback cb;      // invoked with fresh hot data
+  ncfdplane_done_cb donecb;   // invoked on EOF (if !follow) or error
+  void* curry;                // passed to the callbacks
+  int fd;                     // we take ownership of the fd, and close it
+  bool follow;                // keep trying to read past the end (event-based)
+  ncplane* ncp;               // bound ncplane
+  pthread_t tid;              // thread servicing this i/o
+  bool destroyed;             // set in ncfdplane_destroy() in our own context
+} ncfdplane;
+
+typedef struct ncsubproc {
+  ncfdplane* nfp;
+  pid_t pid;                  // subprocess
+  int pidfd;                  // for signaling/watching the subprocess
+} ncsubproc;
 
 typedef struct ncmenu {
   ncplane* ncp;
@@ -273,9 +234,11 @@ typedef struct ncdirect {
   char* initc;    // set a palette entry's RGB value
   char* oc;       // restore original colors
   char* clear;    // clear the screen
+  FILE* ttyfp;    // FILE* for controlling tty, from opts->ttyfp
+  char* sc;       // push the cursor location onto the stack
+  char* rc;       // pop the cursor location off the stack
   bool RGBflag;   // terminfo-reported "RGB" flag for 24bpc truecolor
   bool CCCflag;   // terminfo-reported "CCC" flag for palette set capability
-  FILE* ttyfp;    // FILE* for controlling tty, from opts->ttyfp
   palette256 palette; // 256-indexed palette can be used instead of/with RGB
   uint16_t fgrgb, bgrgb; // last RGB values of foreground/background
   bool fgdefault, bgdefault; // are FG/BG currently using default colors?
@@ -384,7 +347,7 @@ mbstr_find_codepoint(const char* s, char32_t cp, int* col){
     if(r == 0){
       break;
     }
-    if(towlower(cp) == (char32_t)towlower(w)){
+    if(towlower(cp) == towlower(w)){
       return bytes;
     }
     *col += wcwidth(w);
@@ -592,10 +555,10 @@ ns_to_timespec(uint64_t ns, struct timespec* ts){
 static inline void
 cell_debug(const egcpool* p, const cell* c){
 	if(cell_simple_p(c)){
-		fprintf(stderr, "gcluster: %u %c attr: 0x%08x chan: 0x%016lx\n",
+		fprintf(stderr, "gcluster: %u %c attr: 0x%08x chan: 0x%016jx\n",
 				    c->gcluster, c->gcluster, c->attrword, c->channels);
 	}else{
-		fprintf(stderr, "gcluster: %u %s attr: 0x%08x chan: 0x%016lx\n",
+		fprintf(stderr, "gcluster: %u %s attr: 0x%08x chan: 0x%016jx\n",
 				    c->gcluster, egcpool_extended_gcluster(p, c), c->attrword, c->channels);
 	}
 }

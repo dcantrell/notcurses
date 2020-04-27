@@ -1,6 +1,6 @@
 % notcurses_multiselector(3)
 % nick black <nickblack@linux.com>
-% v1.3.0
+% v1.3.3
 
 # NAME
 
@@ -8,7 +8,7 @@ notcurses_multiselector - high level widget for selecting from a set
 
 # SYNOPSIS
 
-**#include <notcurses.h>**
+**#include <notcurses/notcurses.h>**
 
 ```c
 **struct ncinput;**

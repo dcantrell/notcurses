@@ -6,8 +6,8 @@
 #include <unistd.h>
 #include <limits.h>
 #include <stdatomic.h>
-#include <version.h>
 #include <notcurses/notcurses.h>
+#include <version.h>
 #ifdef USE_FFMPEG
 #include <libavutil/pixdesc.h>
 #include <libavutil/avconfig.h>
@@ -37,6 +37,7 @@ int witherworm_demo(struct notcurses* nc);
 int box_demo(struct notcurses* nc);
 int trans_demo(struct notcurses* nc);
 int chunli_demo(struct notcurses* nc);
+int qrcode_demo(struct notcurses* nc);
 int grid_demo(struct notcurses* nc);
 int fallin_demo(struct notcurses* nc);
 int highcontrast_demo(struct notcurses* nc);
@@ -62,14 +63,14 @@ void interrupt_and_restart_demos(void);
 // demos should not call notcurses_getc() directly, as it's being monitored by
 // the toplevel event listener. instead, call this intermediate API. just
 // replace 'notcurses' with 'demo'.
-char32_t demo_getc(const struct timespec* ts, ncinput* ni);
+char32_t demo_getc(struct notcurses* nc, const struct timespec* ts, ncinput* ni);
 
 // 'ni' may be NULL if the caller is uninterested in event details. If no event
 // is ready, returns 0.
 static inline char32_t
-demo_getc_nblock(ncinput* ni){
+demo_getc_nblock(struct notcurses* nc, ncinput* ni){
   struct timespec ts = { .tv_sec = 0, .tv_nsec = 0 };
-  return demo_getc(&ts, ni);
+  return demo_getc(nc, &ts, ni);
 }
 
 // Get a fd which can be poll()ed to check for outstanding input. Do not close
@@ -79,8 +80,8 @@ int demo_input_fd(void);
 // 'ni' may be NULL if the caller is uninterested in event details. Blocks
 // until an event is processed or a signal is received.
 static inline char32_t
-demo_getc_blocking(ncinput* ni){
-  return demo_getc(NULL, ni);
+demo_getc_blocking(struct notcurses* nc, ncinput* ni){
+  return demo_getc(nc, NULL, ni);
 }
 /*----------------------------- end demo input API -------------------------*/
 
@@ -151,12 +152,10 @@ int demo_render(struct notcurses* nc);
 
 #define DEMO_RENDER(nc) { int demo_render_err = demo_render(nc); if(demo_render_err){ return demo_render_err; }}
 
-// locked by callers to notcurses_render() and notcurses_refresh(), all internal
-void lock_demo_render(void);
-void unlock_demo_render(void);
-
 // if you won't be doing things, and it's a long sleep, consider using
-// demo_nanosleep(). it updates the HUD, which looks better to the user.
+// demo_nanosleep(). it updates the HUD, which looks better to the user, and
+// dispatches input to the menu/HUD. don't use it if you have other threads
+// rendering or otherwise manipulating state, as it calls notcurses_render().
 int demo_nanosleep(struct notcurses* nc, const struct timespec *ts);
 
 int demo_fader(struct notcurses* nc, struct ncplane* ncp, void* curry);

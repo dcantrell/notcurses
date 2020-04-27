@@ -184,18 +184,18 @@ cursor_invalid_p(const ncplane* n){
   return false;
 }
 
-int ncplane_at_cursor(ncplane* n, cell* c){
+char* ncplane_at_cursor(ncplane* n, uint32_t* attrword, uint64_t* channels){
   if(cursor_invalid_p(n)){
-    return -1;
+    return NULL;
   }
-  return cell_duplicate(n, c, &n->fb[nfbcellidx(n, n->y, n->x)]);
+  return cell_extract(n, &n->fb[nfbcellidx(n, n->y, n->x)], attrword, channels);
 }
 
-int ncplane_at_yx(ncplane* n, int y, int x, cell* c){
-  int ret = -1;
+char* ncplane_at_yx(ncplane* n, int y, int x, uint32_t* attrword, uint64_t* channels){
+  char* ret = NULL;
   if(y < n->leny && x < n->lenx){
     if(y >= 0 && x >= 0){
-      ret = cell_duplicate(n, c, &n->fb[nfbcellidx(n, y, x)]);
+      ret = cell_extract(n, &n->fb[nfbcellidx(n, y, x)], attrword, channels);
     }
   }
   return ret;
@@ -676,8 +676,8 @@ static void
 reset_stats(ncstats* stats){
   uint64_t fbbytes = stats->fbbytes;
   memset(stats, 0, sizeof(*stats));
-  stats->render_min_ns = 1ul << 62u;
-  stats->render_min_bytes = 1ul << 62u;
+  stats->render_min_ns = 1ull << 62u;
+  stats->render_min_bytes = 1ull << 62u;
   stats->fbbytes = fbbytes;
 }
 
@@ -745,6 +745,9 @@ ffmpeg_log_level(ncloglevel_e level){
 }
 
 ncdirect* ncdirect_init(const char* termtype, FILE* outfp){
+  if(outfp == NULL){
+    outfp = stdout;
+  }
   ncdirect* ret = malloc(sizeof(*ret));
   if(ret == NULL){
     return ret;
@@ -808,6 +811,9 @@ ncdirect* ncdirect_init(const char* termtype, FILE* outfp){
 }
 
 notcurses* notcurses_init(const notcurses_options* opts, FILE* outfp){
+  if(outfp == NULL){
+    outfp = stdout;
+  }
   notcurses_options defaultopts;
   memset(&defaultopts, 0, sizeof(defaultopts));
   if(!opts){
@@ -930,11 +936,15 @@ notcurses* notcurses_init(const notcurses_options* opts, FILE* outfp){
           LIBAVFORMAT_VERSION_MAJOR, LIBAVFORMAT_VERSION_MINOR, LIBAVFORMAT_VERSION_MICRO,
           LIBAVUTIL_VERSION_MAJOR, LIBAVUTIL_VERSION_MINOR, LIBAVUTIL_VERSION_MICRO,
           LIBSWSCALE_VERSION_MAJOR, LIBSWSCALE_VERSION_MINOR, LIBSWSCALE_VERSION_MICRO);
-    fflush(stdout);
+#else
+#ifdef USE_OIIO
+    printf("  openimageio %s\n", oiio_version());
 #else
     term_fg_palindex(ret, ret->ttyfp, ret->colors <= 88 ? 1 % ret->colors : 0xcb);
-    fprintf(stderr, "\n Warning! Notcurses was built without ffmpeg support\n");
+    fprintf(stderr, "\n Warning! Notcurses was built without multimedia support\n");
 #endif
+#endif
+    fflush(stdout);
     term_fg_palindex(ret, ret->ttyfp, ret->colors <= 88 ? 1 % ret->colors : 0xcb);
     if(!ret->RGBflag){ // FIXME
       fprintf(stderr, "\n Warning! Colors subject to https://github.com/dankamongmen/notcurses/issues/4");
@@ -1022,7 +1032,7 @@ int notcurses_stop(notcurses* nc){
                   NANOSECS_IN_SEC * (double)nc->stashstats.renders / nc->stashstats.render_ns : 0.0,
                 nc->stashstats.failed_renders,
                 nc->stashstats.failed_renders == 1 ? "" : "s");
-        fprintf(stderr, "RGB emits:elides: def %lu:%lu fg %lu:%lu bg %lu:%lu\n",
+        fprintf(stderr, "RGB emits:elides: def %ju:%ju fg %ju:%ju bg %ju:%ju\n",
                 nc->stashstats.defaultemissions,
                 nc->stashstats.defaultelisions,
                 nc->stashstats.fgemissions,
@@ -1123,7 +1133,7 @@ int ncplane_set_base_cell(ncplane* ncp, const cell* c){
   return cell_duplicate(ncp, &ncp->basecell, c);
 }
 
-int ncplane_set_base(ncplane* ncp, uint64_t channels, uint32_t attrword, const char* egc){
+int ncplane_set_base(ncplane* ncp, const char* egc, uint32_t attrword, uint64_t channels){
   return cell_prime(ncp, &ncp->basecell, egc, attrword, channels);
 }
 
@@ -1210,6 +1220,22 @@ cell_obliterate(ncplane* n, cell* c){
   cell_init(c);
 }
 
+// increment y by 1 and rotate the framebuffer up one line. x moves to 0.
+static inline void
+scroll_down(ncplane* n){
+  n->x = 0;
+  if(n->y == n->leny - 1){
+    n->logrow = (n->logrow + 1) % n->leny;
+    cell* row = n->fb + nfbcellidx(n, n->y, 0);
+    for(int clearx = 0 ; clearx < n->lenx ; ++clearx){
+      cell_release(n, &row[clearx]);
+    }
+    memset(row, 0, sizeof(*row) * n->lenx);
+  }else{
+    ++n->y;
+  }
+}
+
 int ncplane_putc_yx(ncplane* n, int y, int x, const cell* c){
   // if scrolling is enabled, check *before ncplane_cursor_move_yx()* whether
   // we're past the end of the line, and move to the next line if so.
@@ -1218,20 +1244,16 @@ int ncplane_putc_yx(ncplane* n, int y, int x, const cell* c){
     if(!n->scrolling){
       return -1;
     }
-    n->x = 0;
-    if(n->y == n->leny - 1){
-      n->logrow = (n->logrow + 1) % n->leny;
-      cell* row = n->fb + nfbcellidx(n, n->y, 0);
-      for(int clearx = 0 ; clearx < n->lenx ; ++clearx){
-        cell_release(n, &row[clearx]);
-      }
-      memset(row, 0, sizeof(*row) * n->lenx);
-    }else{
-      ++n->y;
-    }
+    scroll_down(n);
   }
   if(ncplane_cursor_move_yx(n, y, x)){
     return -1;
+  }
+  if(c->gcluster == '\n'){
+    if(n->scrolling){
+      scroll_down(n);
+      return 0;
+    }
   }
   // A wide character obliterates anything to its immediate right (and marks
   // that cell as wide). Any character placed atop one half of a wide character
@@ -1842,6 +1864,10 @@ void ncplane_translate(const ncplane* src, const ncplane* dst,
   if(x){
     *x = src->absx - dst->absx + *x;
   }
+}
+
+notcurses* ncplane_notcurses(ncplane* n){
+  return n->nc;
 }
 
 ncplane* ncplane_reparent(ncplane* n, ncplane* newparent){

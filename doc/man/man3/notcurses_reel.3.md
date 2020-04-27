@@ -1,6 +1,6 @@
 % notcurses_reel(3)
 % nick black <nickblack@linux.com>
-% v1.3.0
+% v1.3.3
 
 # NAME
 
@@ -8,7 +8,7 @@ notcurses_reel - high-level widget for hierarchical data
 
 # SYNOPSIS
 
-**#include <notcurses.h>**
+**#include <notcurses/notcurses.h>**
 
 ```c
 typedef struct ncreel_options {

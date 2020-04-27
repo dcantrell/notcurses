@@ -34,6 +34,7 @@ drop_bricks(struct notcurses* nc, struct ncplane** arr, int arrcount){
       bool felloff = true;
       for(int i = 0 ; i < rangee - ranges ; ++i){
         struct ncplane* ncp = arr[ranges + i];
+        ncplane_move_top(ncp);
         int x, y;
         ncplane_yx(ncp, &y, &x);
         if(felloff){
@@ -65,7 +66,7 @@ drop_bricks(struct notcurses* nc, struct ncplane** arr, int arrcount){
           ranges += i;
           i = 0;
         }
-        nanosleep(&iterdelay, NULL);
+        demo_nanosleep(nc, &iterdelay);
       }
     }while(rangee - ranges + 1 >= FALLINGMAX);
   }
@@ -141,7 +142,7 @@ int fallin_demo(struct notcurses* nc){
             continue;
           }
           cell c = CELL_TRIVIAL_INITIALIZER;
-          if(ncplane_at_yx(stdn, usey, usex, &c) < 0){
+          if(ncplane_at_yx_cell(stdn, usey, usex, &c) < 0){
             return -1;
           }
           if(!cell_simple_p(&c)){
@@ -174,16 +175,17 @@ int fallin_demo(struct notcurses* nc){
     }
   }
   free(usemap);
-#ifdef USE_FFMPEG
+  ncplane_erase(stdn);
+#ifdef USE_MULTIMEDIA
 #ifndef DFSG_BUILD
-  int averr = 0;
+  nc_err_e err = NCERR_SUCCESS;
   char* path = find_data("lamepatents.jpg");
-  struct ncvisual* ncv = ncplane_visual_open(stdn, path, &averr);
+  struct ncvisual* ncv = ncplane_visual_open(stdn, path, &err);
   free(path);
   if(ncv == NULL){
     return -1;
   }
-  if(ncvisual_decode(ncv, &averr) == NULL){
+  if((err = ncvisual_decode(ncv)) != NCERR_SUCCESS){
     ncvisual_destroy(ncv);
     return -1;
   }
@@ -191,8 +193,7 @@ int fallin_demo(struct notcurses* nc){
     ncvisual_destroy(ncv);
     return -1;
   }
-  assert(ncvisual_decode(ncv, &averr) == NULL);
-  assert(averr == AVERROR_EOF);
+  assert(ncvisual_decode(ncv) == NCERR_EOF);
   ncvisual_destroy(ncv);
 #endif
 #endif

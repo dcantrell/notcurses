@@ -1,4 +1,5 @@
 #include <array>
+#include <memory>
 #include <cstring>
 #include <cstdlib>
 #include <clocale>
@@ -7,15 +8,8 @@
 #include <libgen.h>
 #include <unistd.h>
 #include <iostream>
-#include <memory>
-#include <ncpp/NotCurses.hh>
 #include <ncpp/Visual.hh>
-
-extern "C" {
-#include <libavutil/pixdesc.h>
-#include <libavutil/avconfig.h>
-#include <libavcodec/avcodec.h> // ffmpeg doesn't reliably "C"-guard itself
-}
+#include <ncpp/NotCurses.hh>
 
 using namespace ncpp;
 
@@ -23,7 +17,7 @@ static void usage(std::ostream& os, const char* name, int exitcode)
   __attribute__ ((noreturn));
 
 void usage(std::ostream& o, const char* name, int exitcode){
-  o << "usage: " << name << " [ -h ] [ -l loglevel ] [ -d mult ] [ -s scaletype ] files" << '\n';
+  o << "usage: " << name << " [ -h ] [ -l loglevel ] [ -d mult ] [ -s scaling ] files" << '\n';
   o << " -l loglevel: integer between 0 and 9, goes to stderr'\n";
   o << " -s scaletype: one of 'none', 'scale', or 'stretch'\n";
   o << " -d mult: non-negative floating point scale for frame time" << std::endl;
@@ -67,7 +61,7 @@ int perframe([[maybe_unused]] struct notcurses* _nc, struct ncvisual* ncv, void*
       uint64_t channels = 0;
       channels_set_fg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
       channels_set_bg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
-      ncplane_set_base(subtitle_plane, channels, 0, "");
+      ncplane_set_base(subtitle_plane, "", 0, channels);
       ncplane_set_fg(subtitle_plane, 0x00ffff);
       ncplane_set_fg_alpha(subtitle_plane, CELL_ALPHA_HIGHCONTRAST);
       ncplane_set_bg_alpha(subtitle_plane, CELL_ALPHA_TRANSPARENT);
@@ -85,7 +79,7 @@ int perframe([[maybe_unused]] struct notcurses* _nc, struct ncvisual* ncv, void*
   ns -= s * NANOSECS_IN_SEC;
   stdn->printf(0, NCAlign::Right, "%02ld:%02ld:%02ld.%04ld",
                h, m, s, ns / 1000000);
-  if(nc.render()){
+  if(!nc.render()){
     return -1;
   }
   int dimx, dimy, oldx, oldy, keepy, keepx;
@@ -170,22 +164,20 @@ int main(int argc, char** argv){
   int dimy, dimx;
   nc.get_term_dim(&dimy, &dimx);
   for(auto i = nonopt ; i < argc ; ++i){
-    std::array<char, 128> errbuf;
     int frames = 0;
-    int averr;
+    nc_err_e err;
     std::unique_ptr<Visual> ncv;
     try{
-      ncv = std::make_unique<Visual>(argv[i], &averr, 1, 0, stretchmode);
+      ncv = std::make_unique<Visual>(argv[i], &err, 1, 0, stretchmode);
     }catch(std::exception& e){
       nc.stop();
       std::cerr << argv[i] << ": " << e.what() << "\n";
       return EXIT_FAILURE;
     }
-    int r = ncv->stream(&averr, timescale, perframe, &frames);
+    int r = ncv->stream(&err, timescale, perframe, &frames);
     if(r < 0){ // positive is intentional abort
-      av_make_error_string(errbuf.data(), errbuf.size(), averr);
       nc.stop();
-      std::cerr << "Error decoding " << argv[i] << ": " << errbuf.data() << std::endl;
+      std::cerr << "Error decoding " << argv[i] << ": " << nc_strerror(err) << std::endl;
       return EXIT_FAILURE;
     }else if(r == 0){
       std::unique_ptr<Plane> stdn(nc.get_stdplane());

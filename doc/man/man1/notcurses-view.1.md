@@ -1,6 +1,6 @@
 % notcurses-view(1)
 % nick black <nickblack@linux.com>
-% v1.3.0
+% v1.3.3
 
 # NAME
 
@@ -12,12 +12,12 @@ notcurses-view - Render images and video to the console
 
 # DESCRIPTION
 
-**notcurses-view** uses the FFmpeg libraries and notcurses to render images
+**notcurses-view** uses a multimedian-enabled notcurses to render images
 and videos to the terminal. Media will be scaled to the terminal's size.
 
 # OPTIONS
 
-**-d delaymult**: Apply a rational multiplier to the standard delay of 1s.
+**-d delaymult**: Apply a rational multiplier to the framerate.
 
 **-l loglevel**: Log everything (high log level) or nothing (log level 0) to stderr.
 

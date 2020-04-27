@@ -93,7 +93,7 @@ typedef struct ncinput {
   uint64_t seqnum;
 } ncinput;
 int ncplane_set_base_cell(struct ncplane* ncp, const cell* c);
-int ncplane_set_base(struct ncplane* ncp, uint64_t channels, uint32_t attrword, const char* egc);
+int ncplane_set_base(struct ncplane* ncp, const char* egc, uint32_t attrword, uint64_t channels);
 int ncplane_base(struct ncplane* ncp, cell* c);
 struct ncplane* notcurses_top(struct notcurses* n);
 void notcurses_drop_planes(struct notcurses* nc);
@@ -128,8 +128,10 @@ int ncplane_move_below(struct ncplane* n, struct ncplane* below);
 int ncplane_move_above(struct ncplane* n, struct ncplane* above);
 struct ncplane* ncplane_below(struct ncplane* n);
 char* notcurses_at_yx(struct notcurses* nc, int yoff, int xoff, uint32_t* attrword, uint64_t* channels);
-int ncplane_at_cursor(struct ncplane* n, cell* c);
-int ncplane_at_yx(struct ncplane* n, int y, int x, cell* c);
+char* ncplane_at_cursor(struct ncplane* n, uint32_t* attrword, uint64_t* channels);
+int ncplane_at_cursor_cell(struct ncplane* n, cell* c);
+char* ncplane_at_yx(struct ncplane* n, int y, int x, uint32_t* attrword, uint64_t* channels);
+int ncplane_at_yx_cell(struct ncplane* n, int y, int x, cell* c);
 void* ncplane_set_userptr(struct ncplane* n, void* opaque);
 void* ncplane_userptr(struct ncplane* n);
 int ncplane_resize(struct ncplane* n, int keepy, int keepx, int keepleny,
@@ -261,20 +263,27 @@ int ncdirect_cursor_up(struct ncdirect* nc, int num);
 int ncdirect_cursor_left(struct ncdirect* nc, int num);
 int ncdirect_cursor_right(struct ncdirect* nc, int num);
 int ncdirect_cursor_down(struct ncdirect* nc, int num);
-struct ncvisual* ncplane_visual_open(struct ncplane* nc, const char* file, int* averr);
+typedef enum {
+  NCERR_SUCCESS,
+  NCERR_NOMEM,
+  NCERR_EOF,
+  NCERR_DECODE,
+  NCERR_UNIMPLEMENTED,
+} nc_err_e;
+struct ncvisual* ncplane_visual_open(struct ncplane* nc, const char* file, nc_err_e* err);
 typedef enum {
   NCSCALE_NONE,
   NCSCALE_SCALE,
   NCSCALE_STRETCH,
 } ncscale_e;
-struct ncvisual* ncvisual_open_plane(struct notcurses* nc, const char* file, int* averr, int y, int x, ncscale_e style);
+struct ncvisual* ncvisual_open_plane(struct notcurses* nc, const char* file, nc_err_e* err, int y, int x, ncscale_e style);
 struct ncplane* ncvisual_plane(struct ncvisual* ncv);
 void ncvisual_destroy(struct ncvisual* ncv);
-struct AVFrame* ncvisual_decode(struct ncvisual* nc, int* averr);
+nc_err_e ncvisual_decode(struct ncvisual* nc);
 int ncvisual_render(const struct ncvisual* ncv, int begy, int begx, int leny, int lenx);
 char* ncvisual_subtitle(const struct ncvisual* ncv);
 typedef int (*streamcb)(struct notcurses* nc, struct ncvisual* ncv, void*);
-int ncvisual_stream(struct notcurses* nc, struct ncvisual* ncv, int* averr, float timescale, streamcb streamer, void* curry);
+int ncvisual_stream(struct notcurses* nc, struct ncvisual* ncv, nc_err_e* err, float timescale, streamcb streamer, void* curry);
 int ncblit_bgrx(struct ncplane* nc, int placey, int placex, int linesize, const unsigned char* data, int begy, int begx, int leny, int lenx);
 int ncblit_rgba(struct ncplane* nc, int placey, int placex, int linesize, const unsigned char* data, int begy, int begx, int leny, int lenx);
 struct selector_item {
@@ -413,26 +422,32 @@ void ncplane_translate(const struct ncplane* src, const struct ncplane* dst, int
 bool ncplane_translate_abs(const struct ncplane* n, int* y, int* x);
 typedef enum {
   NCPLOT_1x1,   // full block                █
-  NCPLOT_2x1,   // full/(upper|left) blocks  █▀
-  NCPLOT_1x1x4, // shaded full blocks        █▓▒░
+  NCPLOT_2x1,   // full/(upper|left) blocks  ▄█
+  NCPLOT_1x1x4, // shaded full blocks        ▓▒░█
+  NCPLOT_2x2,   // quadrants                 ▗▐ ▖▄▟▌▙█
   NCPLOT_4x1,   // four vert/horz levels     █▆▄▂ / ▎▌▊█
-  NCPLOT_8x1,   // eight vert/horz levels         █▇▆▅▄▃▂▁ / ▏▎▍▌▋▊▉█
+  NCPLOT_4x2,   // 4 rows, 2 cols (braille)  ⡀⡄⡆⡇⢀⣀⣄⣆⣇⢠⣠⣤⣦⣧⢰⣰⣴⣶⣷⢸⣸⣼⣾⣿
+  NCPLOT_8x1,   // eight vert/horz levels    █▇▆▅▄▃▂▁ / ▏▎▍▌▋▊▉█
 } ncgridgeom_e;
 typedef struct ncplot_options {
   uint64_t maxchannel;
   uint64_t minchannel;
   ncgridgeom_e gridtype;
   uint64_t rangex;
-  uint64_t miny, maxy;
   bool labelaxisd;
-  bool exponentialy;
+  bool exponentially;
   bool vertical_indep;
 } ncplot_options;
-struct ncplot* ncplot_create(struct ncplane* n, const ncplot_options* opts);
-struct ncplane* ncplot_plane(struct ncplot* n);
-int ncplot_add_sample(struct ncplot* n, uint64_t x, uint64_t y);
-int ncplot_set_sample(struct ncplot* n, uint64_t x, uint64_t y);
-void ncplot_destroy(struct ncplot* n);
+struct ncuplot* ncuplot_create(struct ncplane* n, const ncplot_options* opts, uint64_t miny, uint64_t maxy);
+struct ncdplot* ncdplot_create(struct ncplane* n, const ncplot_options* opts, double miny, double maxy);
+struct ncplane* ncuplot_plane(struct ncuplot* n);
+struct ncplane* ncdplot_plane(struct ncdplot* n);
+int ncuplot_add_sample(struct ncuplot* n, uint64_t x, uint64_t y);
+int ncdplot_add_sample(struct ncdplot* n, uint64_t x, double y);
+int ncuplot_set_sample(struct ncuplot* n, uint64_t x, uint64_t y);
+int ncdplot_set_sample(struct ncdplot* n, uint64_t x, double y);
+void ncuplot_destroy(struct ncuplot* n);
+void ncdplot_destroy(struct ncdplot* n);
 bool ncplane_set_scrolling(struct ncplane* n, bool scrollp);
 """)
 

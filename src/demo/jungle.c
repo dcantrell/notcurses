@@ -26652,7 +26652,7 @@ int jungle_demo(struct notcurses* nc){
   free(buf);
   int iter = 0;
   // don't try to run faster than, eh, 140Hz
-  int64_t iterns = GIG / 140;
+  int64_t iterns = GIG / 100;
   int64_t nsrunning;
   do{
     DEMO_RENDER(nc);
@@ -26662,7 +26662,7 @@ int jungle_demo(struct notcurses* nc){
     if(nsrunning < iter * iterns){
       struct timespec sleepts;
       ns_to_timespec(iter * iterns - nsrunning, &sleepts);
-      nanosleep(&sleepts, NULL);
+      demo_nanosleep(nc, &sleepts);
     }
     cycle_palettes(nc, pal);
   }while(nsrunning > 0 && (uint64_t)nsrunning < 5 * timespec_to_ns(&demodelay));

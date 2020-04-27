@@ -14,6 +14,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <notcurses/nckeys.h>
+#include <notcurses/ncerrs.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,10 +28,16 @@ extern "C" {
 // Get a human-readable string describing the running notcurses version.
 API const char* notcurses_version(void);
 
-struct cell;      // a coordinate on an ncplane: an EGC plus styling
-struct ncplane;   // a drawable notcurses surface, composed of cells
-struct ncvisual;  // a visual bit of multimedia opened with LibAV
 struct notcurses; // notcurses state for a given terminal, composed of ncplanes
+struct ncplane;   // a drawable notcurses surface, composed of cells
+struct cell;      // a coordinate on an ncplane: an EGC plus styling
+struct ncvisual;  // a visual bit of multimedia opened with LibAV|OIIO
+struct ncuplot;   // a histogram, bound to a plane (uint64_ts)
+struct ncdplot;   // a histogram, bound to a plane (non-negative doubles)
+struct ncfdplane; // i/o wrapper to dump file descriptor to plane
+struct ncsubproc; // ncfdplane wrapper with subprocess management
+struct ncselector;// widget supporting selecting 1 from a list of options
+struct ncmultiselector; // widget supporting selecting 0..n from n options
 
 // Initialize a direct-mode notcurses context on the connected terminal at 'fp'.
 // 'fp' must be a tty. You'll usually want stdout. Direct mode supportes a
@@ -82,6 +89,16 @@ API int ncdirect_cursor_up(struct ncdirect* nc, int num);
 API int ncdirect_cursor_left(struct ncdirect* nc, int num);
 API int ncdirect_cursor_right(struct ncdirect* nc, int num);
 API int ncdirect_cursor_down(struct ncdirect* nc, int num);
+
+// Get the cursor position, when supported. This requires writing to the
+// terminal, and then reading from it. If the terminal doesn't reply, or
+// doesn't reply in a way we understand, the results might be deleterious.
+API int ncdirect_cursor_yx(struct ncdirect* n, int* y, int* x);
+
+// Push or pop the cursor location to the terminal's stack. The depth of this
+// stack, and indeed its existence, is terminal-dependent.
+API int ncdirect_cursor_push(struct ncdirect* n);
+API int ncdirect_cursor_pop(struct ncdirect* n);
 
 // Clear the screen.
 API int ncdirect_clear(struct ncdirect* nc);
@@ -524,6 +541,198 @@ typedef struct cell {
   uint64_t channels;          // + 8B == 16B
 } cell;
 
+#define CELL_TRIVIAL_INITIALIZER { .gcluster = '\0', .attrword = 0, .channels = 0, }
+#define CELL_SIMPLE_INITIALIZER(c) { .gcluster = (c), .attrword = 0, .channels = 0, }
+#define CELL_INITIALIZER(c, a, chan) { .gcluster = (c), .attrword = (a), .channels = (chan), }
+
+static inline void
+cell_init(cell* c){
+  memset(c, 0, sizeof(*c));
+}
+
+// Breaks the UTF-8 string in 'gcluster' down, setting up the cell 'c'. Returns
+// the number of bytes copied out of 'gcluster', or -1 on failure. The styling
+// of the cell is left untouched, but any resources are released.
+API int cell_load(struct ncplane* n, cell* c, const char* gcluster);
+
+// cell_load(), plus blast the styling with 'attr' and 'channels'.
+static inline int
+cell_prime(struct ncplane* n, cell* c, const char* gcluster,
+           uint32_t attr, uint64_t channels){
+  c->attrword = attr;
+  c->channels = channels;
+  int ret = cell_load(n, c, gcluster);
+  return ret;
+}
+
+// Duplicate 'c' into 'targ'; both must be/will be bound to 'n'.
+API int cell_duplicate(struct ncplane* n, cell* targ, const cell* c);
+
+// Release resources held by the cell 'c'.
+API void cell_release(struct ncplane* n, cell* c);
+
+#define NCSTYLE_MASK      0xffff0000ul
+#define NCSTYLE_STANDOUT  0x00800000ul
+#define NCSTYLE_UNDERLINE 0x00400000ul
+#define NCSTYLE_REVERSE   0x00200000ul
+#define NCSTYLE_BLINK     0x00100000ul
+#define NCSTYLE_DIM       0x00080000ul
+#define NCSTYLE_BOLD      0x00040000ul
+#define NCSTYLE_INVIS     0x00020000ul
+#define NCSTYLE_PROTECT   0x00010000ul
+#define NCSTYLE_ITALIC    0x01000000ul
+
+// Set the specified style bits for the cell 'c', whether they're actively
+// supported or not.
+static inline void
+cell_styles_set(cell* c, unsigned stylebits){
+  c->attrword = (c->attrword & ~NCSTYLE_MASK) | ((stylebits & NCSTYLE_MASK));
+}
+
+// Extract the style bits from the cell's attrword.
+static inline unsigned
+cell_styles(const cell* c){
+  return c->attrword & NCSTYLE_MASK;
+}
+
+// Add the specified styles (in the LSBs) to the cell's existing spec, whether
+// they're actively supported or not.
+static inline void
+cell_styles_on(cell* c, unsigned stylebits){
+  c->attrword |= (stylebits & NCSTYLE_MASK);
+}
+
+// Remove the specified styles (in the LSBs) from the cell's existing spec.
+static inline void
+cell_styles_off(cell* c, unsigned stylebits){
+  c->attrword &= ~(stylebits & NCSTYLE_MASK);
+}
+
+// Use the default color for the foreground.
+static inline void
+cell_set_fg_default(cell* c){
+  channels_set_fg_default(&c->channels);
+}
+
+// Use the default color for the background.
+static inline void
+cell_set_bg_default(cell* c){
+  channels_set_bg_default(&c->channels);
+}
+
+static inline int
+cell_set_fg_alpha(cell* c, int alpha){
+  return channels_set_fg_alpha(&c->channels, alpha);
+}
+
+static inline int
+cell_set_bg_alpha(cell* c, int alpha){
+  return channels_set_bg_alpha(&c->channels, alpha);
+}
+
+// Does the cell contain an East Asian Wide codepoint?
+static inline bool
+cell_double_wide_p(const cell* c){
+  return (c->channels & CELL_WIDEASIAN_MASK);
+}
+
+// Is this the right half of a wide character?
+static inline bool
+cell_wide_right_p(const cell* c){
+  return cell_double_wide_p(c) && c->gcluster == 0;
+}
+
+// Is this the left half of a wide character?
+static inline bool
+cell_wide_left_p(const cell* c){
+  return cell_double_wide_p(c) && c->gcluster;
+}
+
+// Is the cell simple (a lone ASCII character, encoded as such)?
+static inline bool
+cell_simple_p(const cell* c){
+  return c->gcluster < 0x80;
+}
+
+// return a pointer to the NUL-terminated EGC referenced by 'c'. this pointer
+// is invalidated by any further operation on the plane 'n', so...watch out!
+API const char* cell_extended_gcluster(const struct ncplane* n, const cell* c);
+
+// Extract the EGC from 'c' as a nul-terminated string.
+static inline char*
+cell_strdup(const struct ncplane* n, const cell* c){
+  char* ret;
+  if(cell_simple_p(c)){
+    if( (ret = (char*)malloc(2)) ){ // cast is here for C++ clients
+      ret[0] = c->gcluster;
+      ret[1] = '\0';
+    }
+  }else{
+    ret = strdup(cell_extended_gcluster(n, c));
+  }
+  return ret;
+}
+
+// Extract the three elements of a cell.
+static inline char*
+cell_extract(const struct ncplane* n, const cell* c, uint32_t* attrword, uint64_t* channels){
+  if(attrword){
+    *attrword = c->attrword;
+  }
+  if(channels){
+    *channels = c->channels;
+  }
+  return cell_strdup(n, c);
+}
+
+// Returns true if the two cells are distinct EGCs, attributes, or channels.
+// The actual egcpool index needn't be the same--indeed, the planes needn't even
+// be the same. Only the expanded EGC must be equal. The EGC must be bit-equal;
+// it would probably be better to test whether they're Unicode-equal FIXME.
+static inline bool
+cellcmp(const struct ncplane* n1, const cell* RESTRICT c1,
+        const struct ncplane* n2, const cell* RESTRICT c2){
+  if(c1->attrword != c2->attrword){
+    return true;
+  }
+  if(c1->channels != c2->channels){
+    return true;
+  }
+  if(cell_simple_p(c1) && cell_simple_p(c2)){
+    return c1->gcluster != c2->gcluster;
+  }
+  if(cell_simple_p(c1) || cell_simple_p(c2)){
+    return true;
+  }
+  return strcmp(cell_extended_gcluster(n1, c1), cell_extended_gcluster(n2, c2));
+}
+
+// True if the cell does not generate foreground pixels (i.e., the cell is
+// entirely whitespace or special characters).
+// FIXME do this at cell prep time and set a bit in the channels
+static inline bool
+cell_noforeground_p(const cell* c){
+  return cell_simple_p(c) && (c->gcluster == ' ' || !isprint(c->gcluster));
+}
+
+static inline int
+cell_load_simple(struct ncplane* n, cell* c, char ch){
+  cell_release(n, c);
+  c->channels &= ~CELL_WIDEASIAN_MASK;
+  c->gcluster = ch;
+  if(cell_simple_p(c)){
+    return 1;
+  }
+  return -1;
+}
+
+// get the offset into the egcpool for this cell's EGC. returns meaningless and
+// unsafe results if called on a simple cell.
+static inline uint32_t
+cell_egc_idx(const cell* c){
+  return c->gcluster - 0x80;
+}
+
 // These log levels consciously map cleanly to those of libav; notcurses itself
 // does not use this full granularity. The log level does not affect the opening
 // and closing banners, which can be disabled via the notcurses_option struct's
@@ -675,6 +884,8 @@ API int notcurses_mouse_disable(struct notcurses* n);
 // primarily useful if the screen is externally corrupted, or if an
 // NCKEY_RESIZE event has been read and you're not ready to render.
 API int notcurses_refresh(struct notcurses* n, int* RESTRICT y, int* RESTRICT x);
+
+API struct notcurses* ncplane_notcurses(struct ncplane* n);
 
 // Return the dimensions of this ncplane.
 API void ncplane_dim_yx(const struct ncplane* n, int* RESTRICT y, int* RESTRICT x);
@@ -862,8 +1073,8 @@ API int ncplane_set_base_cell(struct ncplane* ncp, const cell* c);
 // rendering anywhere that the ncplane's gcluster is 0. Erasing the ncplane
 // does not reset the base cell; this function must be called with an empty
 // 'egc'. 'egc' must be a single extended grapheme cluster.
-API int ncplane_set_base(struct ncplane* ncp, uint64_t channels,
-                         uint32_t attrword, const char* egc);
+API int ncplane_set_base(struct ncplane* ncp, const char* egc,
+                         uint32_t attrword, uint64_t channels);
 
 // Extract the ncplane's base cell into 'c'. The reference is invalidated if
 // 'ncp' is destroyed.
@@ -914,14 +1125,48 @@ API struct ncplane* ncplane_below(struct ncplane* n);
 API int ncplane_rotate_cw(struct ncplane* n);
 API int ncplane_rotate_ccw(struct ncplane* n);
 
-// Retrieve the cell at the cursor location on the specified plane, returning
-// it in 'c'. This copy is safe to use until the ncplane is destroyed/erased.
-API int ncplane_at_cursor(struct ncplane* n, cell* c);
+// Retrieve the current contents of the cell under the cursor. The EGC is
+// returned, or NULL on error. This EGC must be free()d by the caller. The
+// attrword and channels are written to 'attrword' and 'channels', respectively.
+API char* ncplane_at_cursor(struct ncplane* n, uint32_t* attrword, uint64_t* channels);
 
-// Retrieve the cell at the specified location on the specified plane, returning
-// it in 'c'. This copy is safe to use until the ncplane is destroyed/erased.
-// Returns the length of the EGC in bytes.
-API int ncplane_at_yx(struct ncplane* n, int y, int x, cell* c);
+// Retrieve the current contents of the cell under the cursor into 'c'. This
+// cell is invalidated if the associated plane is destroyed.
+static inline int
+ncplane_at_cursor_cell(struct ncplane* n, cell* c){
+  char* egc = ncplane_at_cursor(n, &c->attrword, &c->channels);
+  if(!egc){
+    return -1;
+  }
+  uint64_t channels = c->channels; // need to preserve wide flag
+  int r = cell_load(n, c, egc);
+  c->channels = channels;
+  if(r < 0){
+    free(egc);
+  }
+  return r;
+}
+
+// Retrieve the current contents of the specified cell. The EGC is returned, or
+// NULL on error. This EGC must be free()d by the caller. The attrword and
+// channels are written to 'attrword' and 'channels', respectively.
+API char* ncplane_at_yx(struct ncplane* n, int y, int x,
+                        uint32_t* attrword, uint64_t* channels);
+
+// Retrieve the current contents of the specified cell into 'c'. This cell is
+// invalidated if the associated plane is destroyed.
+static inline int
+ncplane_at_yx_cell(struct ncplane* n, int y, int x, cell* c){
+  char* egc = ncplane_at_yx(n, y, x, &c->attrword, &c->channels);
+  if(!egc){
+    return -1;
+  }
+  uint64_t channels = c->channels; // need to preserve wide flag
+  int r = cell_load(n, c, egc);
+  c->channels = channels;
+  free(egc);
+  return r;
+}
 
 // Manipulate the opaque user pointer associated with this plane.
 // ncplane_set_userptr() returns the previous userptr after replacing
@@ -957,174 +1202,6 @@ API void ncplane_cursor_yx(const struct ncplane* n, int* RESTRICT y, int* RESTRI
 // Get the current channels or attribute word for ncplane 'n'.
 API uint64_t ncplane_channels(const struct ncplane* n);
 API uint32_t ncplane_attr(const struct ncplane* n);
-
-// Working with cells
-
-#define CELL_TRIVIAL_INITIALIZER { .gcluster = '\0', .attrword = 0, .channels = 0, }
-#define CELL_SIMPLE_INITIALIZER(c) { .gcluster = (c), .attrword = 0, .channels = 0, }
-#define CELL_INITIALIZER(c, a, chan) { .gcluster = (c), .attrword = (a), .channels = (chan), }
-
-static inline void
-cell_init(cell* c){
-  memset(c, 0, sizeof(*c));
-}
-
-// Breaks the UTF-8 string in 'gcluster' down, setting up the cell 'c'. Returns
-// the number of bytes copied out of 'gcluster', or -1 on failure. The styling
-// of the cell is left untouched, but any resources are released.
-API int cell_load(struct ncplane* n, cell* c, const char* gcluster);
-
-// cell_load(), plus blast the styling with 'attr' and 'channels'.
-static inline int
-cell_prime(struct ncplane* n, cell* c, const char* gcluster,
-           uint32_t attr, uint64_t channels){
-  c->attrword = attr;
-  c->channels = channels;
-  int ret = cell_load(n, c, gcluster);
-  return ret;
-}
-
-// Duplicate 'c' into 'targ'. Not intended for external use; exposed for the
-// benefit of unit tests.
-API int cell_duplicate(struct ncplane* n, cell* targ, const cell* c);
-
-// Release resources held by the cell 'c'.
-API void cell_release(struct ncplane* n, cell* c);
-
-#define NCSTYLE_MASK      0xffff0000ul
-#define NCSTYLE_STANDOUT  0x00800000ul
-#define NCSTYLE_UNDERLINE 0x00400000ul
-#define NCSTYLE_REVERSE   0x00200000ul
-#define NCSTYLE_BLINK     0x00100000ul
-#define NCSTYLE_DIM       0x00080000ul
-#define NCSTYLE_BOLD      0x00040000ul
-#define NCSTYLE_INVIS     0x00020000ul
-#define NCSTYLE_PROTECT   0x00010000ul
-#define NCSTYLE_ITALIC    0x01000000ul
-
-// Set the specified style bits for the cell 'c', whether they're actively
-// supported or not.
-static inline void
-cell_styles_set(cell* c, unsigned stylebits){
-  c->attrword = (c->attrword & ~NCSTYLE_MASK) | ((stylebits & NCSTYLE_MASK));
-}
-
-// Extract the style bits from the cell's attrword.
-static inline unsigned
-cell_styles(const cell* c){
-  return c->attrword & NCSTYLE_MASK;
-}
-
-// Add the specified styles (in the LSBs) to the cell's existing spec, whether
-// they're actively supported or not.
-static inline void
-cell_styles_on(cell* c, unsigned stylebits){
-  c->attrword |= (stylebits & NCSTYLE_MASK);
-}
-
-// Remove the specified styles (in the LSBs) from the cell's existing spec.
-static inline void
-cell_styles_off(cell* c, unsigned stylebits){
-  c->attrword &= ~(stylebits & NCSTYLE_MASK);
-}
-
-// Use the default color for the foreground.
-static inline void
-cell_set_fg_default(cell* c){
-  channels_set_fg_default(&c->channels);
-}
-
-// Use the default color for the background.
-static inline void
-cell_set_bg_default(cell* c){
-  channels_set_bg_default(&c->channels);
-}
-
-static inline int
-cell_set_fg_alpha(cell* c, int alpha){
-  return channels_set_fg_alpha(&c->channels, alpha);
-}
-
-static inline int
-cell_set_bg_alpha(cell* c, int alpha){
-  return channels_set_bg_alpha(&c->channels, alpha);
-}
-
-// Does the cell contain an East Asian Wide codepoint?
-static inline bool
-cell_double_wide_p(const cell* c){
-  return (c->channels & CELL_WIDEASIAN_MASK);
-}
-
-// Is this the right half of a wide character?
-static inline bool
-cell_wide_right_p(const cell* c){
-  return cell_double_wide_p(c) && c->gcluster == 0;
-}
-
-// Is this the left half of a wide character?
-static inline bool
-cell_wide_left_p(const cell* c){
-  return cell_double_wide_p(c) && c->gcluster;
-}
-
-// Is the cell simple (a lone ASCII character, encoded as such)?
-static inline bool
-cell_simple_p(const cell* c){
-  return c->gcluster < 0x80;
-}
-
-// return a pointer to the NUL-terminated EGC referenced by 'c'. this pointer
-// is invalidated by any further operation on the plane 'n', so...watch out!
-API const char* cell_extended_gcluster(const struct ncplane* n, const cell* c);
-
-// Returns true if the two cells are distinct EGCs, attributes, or channels.
-// The actual egcpool index needn't be the same--indeed, the planes needn't even
-// be the same. Only the expanded EGC must be equal. The EGC must be bit-equal;
-// it would probably be better to test whether they're Unicode-equal FIXME.
-static inline bool
-cellcmp(const struct ncplane* n1, const cell* RESTRICT c1,
-        const struct ncplane* n2, const cell* RESTRICT c2){
-  if(c1->attrword != c2->attrword){
-    return true;
-  }
-  if(c1->channels != c2->channels){
-    return true;
-  }
-  if(cell_simple_p(c1) && cell_simple_p(c2)){
-    return c1->gcluster != c2->gcluster;
-  }
-  if(cell_simple_p(c1) || cell_simple_p(c2)){
-    return true;
-  }
-  return strcmp(cell_extended_gcluster(n1, c1), cell_extended_gcluster(n2, c2));
-}
-
-// True if the cell does not generate foreground pixels (i.e., the cell is
-// entirely whitespace or special characters).
-// FIXME do this at cell prep time and set a bit in the channels
-static inline bool
-cell_noforeground_p(const cell* c){
-  return cell_simple_p(c) && (c->gcluster == ' ' || !isprint(c->gcluster));
-}
-
-static inline int
-cell_load_simple(struct ncplane* n, cell* c, char ch){
-  cell_release(n, c);
-  c->channels &= ~CELL_WIDEASIAN_MASK;
-  c->gcluster = ch;
-  if(cell_simple_p(c)){
-    return 1;
-  }
-  return -1;
-}
-
-// get the offset into the egcpool for this cell's EGC. returns meaningless and
-// unsafe results if called on a simple cell.
-static inline uint32_t
-cell_egc_idx(const cell* c){
-  return c->gcluster - 0x80;
-}
 
 // Replace the cell at the specified coordinates with the provided cell 'c',
 // and advance the cursor by the width of the cell (but not past the end of the
@@ -1939,14 +2016,11 @@ ncplane_double_box_sized(struct ncplane* n, uint32_t attr, uint64_t channels,
                             x + xlen - 1, ctlword);
 }
 
-// multimedia functionality
-struct AVFrame;
-
 // Open a visual (image or video), associating it with the specified ncplane.
-// Returns NULL on any error, writing the AVError to 'averr'.
+// Returns NULL on any error, writing the cause to 'ncerr'.
 // FIXME this ought also take an ncscale_e!
 API struct ncvisual* ncplane_visual_open(struct ncplane* nc, const char* file,
-                                         int* averr);
+                                         nc_err_e* ncerr);
 
 // How to scale the visual in ncvisual_open_plane(). NCSCALE_NONE will open a
 // plane tailored to the visual's exact needs, which is probably larger than the
@@ -1966,7 +2040,7 @@ typedef enum {
 // as possible (given the visible screen), either maintaining aspect ratio
 // (NCSCALE_SCALE) or abandoning it (NCSCALE_STRETCH).
 API struct ncvisual* ncvisual_open_plane(struct notcurses* nc, const char* file,
-                                         int* averr, int y, int x,
+                                         nc_err_e* ncerr, int y, int x,
                                          ncscale_e style);
 
 // Return the plane to which this ncvisual is bound.
@@ -1976,11 +2050,9 @@ API struct ncplane* ncvisual_plane(struct ncvisual* ncv);
 // can be neither decoded nor rendered any further.
 API void ncvisual_destroy(struct ncvisual* ncv);
 
-// extract the next frame from an ncvisual. returns NULL on end of file,
-// writing AVERROR_EOF to 'averr'. returns NULL on a decoding or allocation
-// error, placing the AVError in 'averr'. this frame is invalidated by a
-// subsequent call to ncvisual_decode(), and should not be freed by the caller.
-API struct AVFrame* ncvisual_decode(struct ncvisual* nc, int* averr);
+// extract the next frame from an ncvisual. returns NCERR_EOF on end of file,
+// and NCERR_SUCCESS on success, otherwise some other NCERR.
+API nc_err_e ncvisual_decode(struct ncvisual* nc);
 
 // Render the decoded frame to the associated ncplane. The frame will be scaled
 // to the size of the ncplane per the ncscale_e style. A subregion of the
@@ -2034,7 +2106,7 @@ ncvisual_simple_streamer(struct notcurses* nc, struct ncvisual* ncv, void* curry
 // 300FPS, and a 'timescale' of 10 will result in 3FPS. It is an error to
 // supply 'timescale' less than or equal to 0.
 API int ncvisual_stream(struct notcurses* nc, struct ncvisual* ncv,
-                        int* averr, float timescale, streamcb streamer,
+                        nc_err_e* ncerr, float timescale, streamcb streamer,
                         void* curry);
 
 // Blit a flat array 'data' of BGRx 32-bit values to the ncplane 'nc', offset
@@ -2330,8 +2402,6 @@ typedef struct selector_options {
   uint64_t bgchannels;   // background channels, used only in body
 } selector_options;
 
-struct ncselector;
-
 API struct ncselector* ncselector_create(struct ncplane* n, int y, int x,
                                          const selector_options* opts);
 
@@ -2405,8 +2475,6 @@ typedef struct multiselector_options {
   uint64_t boxchannels;  // border channels
   uint64_t bgchannels;   // background channels, used only in body
 } multiselector_options;
-
-struct ncmultiselector;
 
 API struct ncmultiselector* ncmultiselector_create(struct ncplane* n, int y, int x,
                                                    const multiselector_options* opts);
@@ -2547,6 +2615,9 @@ typedef enum {
 //
 // The 20 levels at first is a special case. When the domain is only 1 unit,
 // and autoscaling is in play, assign 50%.
+//
+// This options structure works for both the ncuplot (uint64_t) and ncdplot
+// (double) types.
 typedef struct ncplot_options {
   // channels for the maximum and minimum levels. linear interpolation will be
   // applied across the domain between these two.
@@ -2558,28 +2629,82 @@ typedef struct ncplot_options {
   // resolution, the independent variable would be the range [0..3600): 3600.
   // if rangex is 0, it is dynamically set to the number of columns.
   int rangex;
-  uint64_t miny, maxy; // y axis min and max. for autodiscovery, set them equal.
   bool labelaxisd; // generate labels for the dependent axis
-  bool exponentialy;  // is y-axis exponential? (not yet implemented)
+  bool exponentially;  // is y-axis exponential? (not yet implemented)
   // independent variable is vertical rather than horizontal
   bool vertical_indep;
 } ncplot_options;
 
 // Use the provided plane 'n' for plotting according to the options 'opts'.
 // The plot will make free use of the entirety of the plane.
-API struct ncplot* ncplot_create(struct ncplane* n, const ncplot_options* opts);
+// for domain autodiscovery, set miny == maxy == 0.
+API struct ncuplot* ncuplot_create(struct ncplane* n, const ncplot_options* opts,
+                                  uint64_t miny, uint64_t maxy);
+API struct ncdplot* ncdplot_create(struct ncplane* n, const ncplot_options* opts,
+                                   double miny, double maxy);
 
 // Return a reference to the ncplot's underlying ncplane.
-API struct ncplane* ncplot_plane(struct ncplot* n);
+API struct ncplane* ncuplot_plane(struct ncuplot* n);
+API struct ncplane* ncdplot_plane(struct ncdplot* n);
 
 // Add to or set the value corresponding to this x. If x is beyond the current
 // x window, the x window is advanced to include x, and values passing beyond
 // the window are lost. The first call will place the initial window. The plot
 // will be redrawn, but notcurses_render() is not called.
-API int ncplot_add_sample(struct ncplot* n, uint64_t x, uint64_t y);
-API int ncplot_set_sample(struct ncplot* n, uint64_t x, uint64_t y);
+API int ncuplot_add_sample(struct ncuplot* n, uint64_t x, uint64_t y);
+API int ncdplot_add_sample(struct ncdplot* n, uint64_t x, double y);
+API int ncuplot_set_sample(struct ncuplot* n, uint64_t x, uint64_t y);
+API int ncdplot_set_sample(struct ncdplot* n, uint64_t x, double y);
 
-API void ncplot_destroy(struct ncplot* n);
+API void ncuplot_destroy(struct ncuplot* n);
+API void ncdplot_destroy(struct ncdplot* n);
+
+typedef int(*ncfdplane_callback)(struct ncfdplane* n, const void* buf, size_t s, void* curry);
+typedef int(*ncfdplane_done_cb)(struct ncfdplane* n, int fderrno, void* curry);
+
+// read from an fd until EOF (or beyond, if follow is set), invoking the user's
+// callback each time. runs in its own context. on EOF or error, the finalizer
+// callback will be invoked, and the user ought destroy the ncfdplane. the
+// data is *not* guaranteed to be nul-terminated, and may contain arbitrary
+// zeroes.
+typedef struct ncfdplane_options {
+  void* curry; // parameter provided to callbacks
+  bool follow; // keep reading after hitting end? (think tail -f)
+} ncfdplane_options;
+
+// Create an ncfdplane around the fd 'fd'. Consider this function to take
+// ownership of the file descriptor, which will be closed in ncfdplane_destroy().
+API struct ncfdplane* ncfdplane_create(struct ncplane* n, const ncfdplane_options* opts,
+                          int fd, ncfdplane_callback cbfxn, ncfdplane_done_cb donecbfxn);
+API struct ncplane* ncfdplane_plane(struct ncfdplane* n);
+API int ncfdplane_destroy(struct ncfdplane* n);
+
+typedef struct ncsubproc_options {
+  ncfdplane_options popts;
+  uint64_t restart_period;  // restart this many seconds after an exit (watch)
+} ncsubproc_options;
+
+// see exec(2). p-types use $PATH. e-type passes environment vars.
+API struct ncsubproc* ncsubproc_createv(struct ncplane* n, const ncsubproc_options* opts,
+                                        const char* bin,  char* const arg[],
+                                        ncfdplane_callback cbfxn, ncfdplane_done_cb donecbfxn);
+API struct ncsubproc* ncsubproc_createvp(struct ncplane* n, const ncsubproc_options* opts,
+                                         const char* bin,  char* const arg[],
+                                         ncfdplane_callback cbfxn, ncfdplane_done_cb donecbfxn);
+API struct ncsubproc* ncsubproc_createvpe(struct ncplane* n, const ncsubproc_options* opts,
+                       const char* bin,  char* const arg[], char* const env[],
+                       ncfdplane_callback cbfxn, ncfdplane_done_cb donecbfxn);
+
+API int ncsubproc_destroy(struct ncsubproc* n);
+
+// Draw a QR code at the current position on the plane. If there is insufficient
+// room to draw the code here, or there is any other error, non-zero will be
+// returned. Otherwise, the QR code "version" (size) is returned. The QR code
+// is (version * 4 + 17) columns wide, and ⌈version * 4 + 17 / 2⌉ rows tall. If
+// maxversion is not zero, it plays a hard limit on the QR code size. Though the
+// max version of current QR codes is 40, greater values are allowed, for
+// future compatability (provide 0 for no artificail bound).
+API int ncplane_qrcode(struct ncplane* n, int maxversion, const void* data, size_t len);
 
 #undef API
 

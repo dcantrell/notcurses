@@ -1,25 +1,30 @@
 Name:          notcurses
-Version:       1.3.0
+Version:       1.3.3
 Release:       1%{?dist}
 Summary:       Character graphics and TUI library
 License:       ASL 2.0
 URL:           https://nick-black.com/dankwiki/index.php/Notcurses
-Source0:       https://github.com/dankamongmen/%{name}/archive/v%{version}.tar.gz
-Source1:       https://github.com/dankamongmen/%{name}/releases/download/v%{version}/v%{version}.tar.gz.asc
-Source2:       https://dank.qemfd.net/dankamongmen.gpg
+Source0:       https://github.com/dankamongmen/notcurses/releases/download/v%{version}/notcurses_%{version}+dfsg.1.orig.tar.xz
+Source1:       https://github.com/dankamongmen/%{name}/releases/download/v%{version}/notcurses_%{version}+dfsg.1.orig.tar.xz.asc
+Source2:       https://nick-black.com/dankamongmen.gpg
 
 BuildRequires: gnupg2
 BuildRequires: cmake
 BuildRequires: gcc-c++
+BuildRequires: libqrcodegen-devel
+BuildRequires: OpenEXR-devel
+BuildRequires: OpenImageIO-devel
 BuildRequires: pandoc
 BuildRequires: python3-devel
-BuildRequires: python3-setuptools
+BuildRequires: python3-cffi
 BuildRequires: pkgconfig(ncurses)
+Requires:      %{name}-data = %{version}-%{release}
 
 %description
 notcurses facilitates the creation of modern TUI programs,
 making full use of Unicode and 24-bit TrueColor. It presents
 an API similar to that of Curses, and rides atop Terminfo.
+This package includes static libraries and example binaries.
 
 %package devel
 Summary:       Development files for the notcurses library
@@ -32,16 +37,23 @@ Development files for the notcurses library.
 %package static
 Summary:       Static library for the notcurses library
 License:       ASL 2.0
-Requires:      %{name}-devel = %{version}-%{release}
+Requires:      %{name}%{?_isa} = %{version}-%{release}
 
 %description static
 A statically-linked version of the notcurses library.
+
+%package data
+Summary:       Data files used by notcurses binaries
+License:       ASL 2.0
+BuildArch:     noarch
+
+%description data
+Multimedia content used by the notcurses example binaries.
 
 %package -n python3-%{name}
 Summary:       Python wrappers for notcurses
 License:       ASL 2.0
 Requires:      %{name}%{?_isa} = %{version}-%{release}
-%{?python_provide:%python_provide python3-%{name}}
 
 %description -n python3-%{name}
 Python wrappers and a demonstration script for the notcurses library.
@@ -54,17 +66,19 @@ Python wrappers and a demonstration script for the notcurses library.
 %build
 mkdir build
 cd build
-%cmake -DUSE_FFMPEG=off -DUSE_TESTS=off ..
+%cmake -DUSE_MULTIMEDIA=oiio -DUSE_TESTS=off -DDFSG_BUILD=on ..
 %make_build
+cd python
+%py3_build
 
 %install
 cd build
 %make_install
 cd python
-python setup.py install --root=%{buildroot} --optimize=1
+%py3_install
 
 %files
-%doc CHANGELOG.md README.md
+%doc CHANGELOG.md OTHERS.md README.md USAGE.md
 %license COPYRIGHT LICENSE
 %{_libdir}/libnotcurses.so.%{version}
 %{_libdir}/libnotcurses.so.1
@@ -74,10 +88,11 @@ python setup.py install --root=%{buildroot} --optimize=1
 %{_bindir}/notcurses-input
 %{_bindir}/notcurses-ncreel
 %{_bindir}/notcurses-tetris
+%{_bindir}/notcurses-view
 # Don't use a wildcard, lest we pull in notcurses-pydemo.1. We install the man
-# pages for notcurses-tester and notcurses-view, binaries we're not yet
-# installing, because we intend to install the binaries Real Soon and it's
-# IMHO not worth mucking with the CMake in the meantime FIXME.
+# pages for notcurses-tester, which we're not yet installing, because we intend
+# to install it Real Soon and it's IMHO not worth mucking with the CMake in the
+# meantime FIXME.
 %{_mandir}/man1/notcurses-demo.1*
 %{_mandir}/man1/notcurses-input.1*
 %{_mandir}/man1/notcurses-ncreel.1*
@@ -99,6 +114,10 @@ python setup.py install --root=%{buildroot} --optimize=1
 %{_libdir}/libnotcurses.a
 %{_libdir}/libnotcurses++.a
 
+%files data
+%{_datadir}/%{name}/*.avi
+%{_datadir}/%{name}/*.jpg
+
 %files -n python3-%{name}
 %{_bindir}/notcurses-pydemo
 %{_mandir}/man1/notcurses-pydemo.1*
@@ -107,5 +126,8 @@ python setup.py install --root=%{buildroot} --optimize=1
 %{python3_sitearch}/*.so
 
 %changelog
-* Tue Apr 07 2020 Nick Black <dankamongmen@gmail.com> - 1.3.0-1
+* Sat Apr 25 2020 Nick Black <dankamongmen@gmail.com> - 1.3.3-1
+- New upstream version, incorporate review feedback
+- Build against OpenImageIO, install notcurses-view and data.
+* Tue Apr 07 2020 Nick Black <dankamongmen@gmail.com> - 1.3.3-1
 - Initial Fedora packaging

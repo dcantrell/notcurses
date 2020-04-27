@@ -7,12 +7,6 @@
 #include <pthread.h>
 #include "demo.h"
 
-// some random value to differentiate a demo abort, as indicated via
-// demo_render() in worm_thread(). we can't use PTHREAD_CANCELED, since we
-// do actually make use of cancellation.
-static int demo_aborted = 0;
-static void* DEMO_ABORTED = &demo_aborted;
-
 // Fill up the screen with as much crazy Unicode as we can, and then set a
 // gremlin loose, looking to brighten up the world.
 
@@ -27,7 +21,7 @@ mathplane(struct notcurses* nc){
   channels_set_fg(&channels, 0x2b50c8); // metallic gold, inverted
   channels_set_fg_alpha(&channels, CELL_ALPHA_BLEND);
   channels_set_bg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
-  ncplane_set_base(n, channels, 0, "");
+  ncplane_set_base(n, "", 0, channels);
   ncplane_set_fg(n, 0xd4af37); // metallic gold
   ncplane_set_bg(n, 0x0);
   if(n){
@@ -61,7 +55,7 @@ lighten(struct ncplane* n, cell* c, int distance, int y, int x){
 
 static void
 surrounding_cells(struct ncplane* n, cell* lightup, int y, int x){
-  ncplane_at_yx(n, y, x, lightup);
+  ncplane_at_yx_cell(n, y, x, lightup);
 }
 
 static int
@@ -131,38 +125,42 @@ wormy(worm* s, int dimy, int dimx){
   return 0;
 }
 
-// each worm wanders around aimlessly. it lights up the cells around it; to do
-// this, we keep an array of 13 cells with the original colors, which we tune up.
-static void *
-worm_thread(void* vnc){
-  struct notcurses* nc = vnc;
-  int dimy, dimx;
-  notcurses_term_dim_yx(nc, &dimy, &dimx);
-  int wormcount = (dimy * dimx) / 800;
-  worm worms[wormcount];
-  for(int s = 0 ; s < wormcount ; ++s){
-    init_worm(&worms[s], dimy, dimx);
+struct worm_ctx {
+  int wormcount;
+  worm* worms;
+};
+
+int init_worms(struct worm_ctx* wctx, int dimy, int dimx){
+  if((wctx->wormcount = (dimy * dimx) / 800) == 0){
+    wctx->wormcount = 1;
   }
-  while(true){
-    pthread_testcancel();
-    for(int s = 0 ; s < wormcount ; ++s){
-      if(wormy_top(nc, &worms[s])){
-        return NULL;
-      }
-    }
-    int err;
-    if( (err = demo_render(nc)) ){
-      if(err > 0){
-        return DEMO_ABORTED;
-      }
-    }
-    for(int s = 0 ; s < wormcount ; ++s){
-      if(wormy(&worms[s], dimy, dimx)){
-        return NULL;
-      }
+  if((wctx->worms = malloc(sizeof(*wctx->worms) * wctx->wormcount)) == NULL){
+    return -1;
+  }
+  for(int s = 0 ; s < wctx->wormcount ; ++s){
+    init_worm(&wctx->worms[s], dimy, dimx);
+  }
+  return 0;
+}
+
+// the whiteworms wander around aimlessly, lighting up cells around themselves
+static int
+worm_move(struct notcurses* nc, struct worm_ctx* wctx, int dimy, int dimx){
+  for(int s = 0 ; s < wctx->wormcount ; ++s){
+    if(wormy_top(nc, &wctx->worms[s])){
+      return -1;
     }
   }
-  return NULL;
+  int err;
+  if( (err = demo_render(nc)) ){
+    return err;
+  }
+  for(int s = 0 ; s < wctx->wormcount ; ++s){
+    if(wormy(&wctx->worms[s], dimy, dimx)){
+      return -1;
+    }
+  }
+  return 0;
 }
 
 static int
@@ -171,7 +169,7 @@ message(struct ncplane* n, int maxy, int maxx, int num, int total,
   uint64_t channels = 0;
   channels_set_fg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
   channels_set_bg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
-  ncplane_set_base(n, channels, 0, "");
+  ncplane_set_base(n, "", 0, channels);
   ncplane_set_fg_rgb(n, 255, 255, 255);
   ncplane_set_bg_rgb(n, 32, 64, 32);
   channels = 0;
@@ -555,26 +553,27 @@ int witherworm_demo(struct notcurses* nc){
         }
         ncplane_fadein(n, &tv, demo_fader, NULL);
       }
-      pthread_t tid;
-      pthread_create(&tid, NULL, worm_thread, nc);
+
+      struct worm_ctx wctx;
+      if( (err = init_worms(&wctx, maxy, maxx)) ){
+        return err;
+      }
+      struct timespec cur;
       do{
-        struct timespec left, cur;
-        clock_gettime(CLOCK_MONOTONIC, &cur);
-        timespec_subtract(&left, &screenend, &cur);
-        key = demo_getc(&left, NULL);
-        clock_gettime(CLOCK_MONOTONIC, &cur);
-        int64_t ns = timespec_subtract_ns(&cur, &screenend);
-        if(ns > 0){
+        if( (err = worm_move(nc, &wctx, maxy, maxx)) ){
           break;
         }
-      }while(key < 0);
-      pthread_cancel(tid);
-      void* result = NULL;
-      pthread_join(tid, &result);
+        key = demo_getc_nblock(nc, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &cur);
+        if(timespec_to_ns(&screenend) < timespec_to_ns(&cur)){
+          break;
+        }
+      }while(key == 0);
+
       ncplane_destroy(mess);
       ncplane_destroy(math);
-      if(result == DEMO_ABORTED){
-        return 1;
+      if(err){
+        return err;
       }
       if(key == NCKEY_RESIZE){
         DEMO_RENDER(nc);

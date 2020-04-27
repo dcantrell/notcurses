@@ -6,8 +6,6 @@
 // their mouse. it should always be on the top of the z-stack.
 struct ncplane* hud = NULL;
 
-static pthread_mutex_t demo_render_lock = PTHREAD_MUTEX_INITIALIZER;
-
 // while the HUD is grabbed by the mouse, these are set to the position where
 // the grab started. they are reset once the HUD is released.
 static int hud_grab_x = -1;
@@ -58,7 +56,7 @@ hud_standard_bg(struct ncplane* n){
   channels_set_fg_rgb(&channels, 0x0, 0x0, 0x0);
   channels_set_bg_alpha(&channels, CELL_ALPHA_BLEND);
   channels_set_bg_rgb(&channels, 0x0, 0x0, 0x0);
-  if(ncplane_set_base(n, channels, 0, "") >= 0){
+  if(ncplane_set_base(n, "", 0, channels) >= 0){
     return -1;
   }
   return 0;
@@ -103,7 +101,7 @@ about_toggle(struct notcurses* nc){
   channels_set_fg_rgb(&channels, 0x0, 0x0, 0x0);
   channels_set_bg_alpha(&channels, CELL_ALPHA_BLEND);
   channels_set_bg_rgb(&channels, 0x0, 0x0, 0x0);
-  if(ncplane_set_base(n, channels, 0, "") >= 0){
+  if(ncplane_set_base(n, "", 0, channels) >= 0){
     ncplane_set_fg(n, 0xc0f0c0);
     ncplane_set_bg(n, 0);
     ncplane_set_bg_alpha(n, CELL_ALPHA_BLEND);
@@ -346,10 +344,6 @@ int hud_completion_notify(const demoresult* result){
   return 0;
 }
 
-static void unlock_mutex(void* vm){
-  pthread_mutex_unlock(vm);
-}
-
 // inform the HUD of an upcoming demo
 int hud_schedule(const char* demoname){
   elem* cure;
@@ -398,28 +392,35 @@ int hud_schedule(const char* demoname){
 // wake up every 100ms and render a frame so the HUD doesn't appear locked up
 int demo_nanosleep(struct notcurses* nc, const struct timespec *ts){
   struct timespec fsleep;
-  if(hud){
-    uint64_t nstotal = timespec_to_ns(ts);
-    uint64_t deadline;
-    struct timespec now;
+  uint64_t nstotal = timespec_to_ns(ts);
+  uint64_t deadline;
+  struct timespec now;
 
-    clock_gettime(CLOCK_MONOTONIC_RAW, &now);
-    deadline = timespec_to_ns(&now) + nstotal;
-    while(deadline - timespec_to_ns(&now) > GIG / 10){
-      fsleep.tv_sec = 0;
-      fsleep.tv_nsec = GIG / 10;
-      nanosleep(&fsleep, NULL);
-      demo_render(nc);
-      clock_gettime(CLOCK_MONOTONIC_RAW, &now);
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  deadline = timespec_to_ns(&now) + nstotal;
+  do{
+    fsleep.tv_sec = 0;
+    fsleep.tv_nsec = GIG / 10;
+    if(deadline - timespec_to_ns(&now) < GIG / 10){
+      fsleep.tv_nsec = deadline - timespec_to_ns(&now);
     }
-    ns_to_timespec(deadline - timespec_to_ns(&now), &fsleep);
-  }else{
-    fsleep = *ts;
-  }
-  nanosleep(&fsleep, NULL);
+    ncinput ni;
+    // throw away any input we receive. if it was for the menu or HUD, it was
+    // already dispatched internally to demo_getc().
+    char32_t id;
+    if((id = demo_getc(nc, &fsleep, &ni)) > 0){
+      return -1;
+    }
+    if(hud){
+      demo_render(nc);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &now);
+  }while(deadline > timespec_to_ns(&now));
+  ns_to_timespec(deadline - timespec_to_ns(&now), &fsleep);
   return 0;
 }
 
+// FIXME needs to pass back any ncinput read, if requested...hrmmm
 int demo_render(struct notcurses* nc){
   if(interrupted){
     return 1;
@@ -450,20 +451,15 @@ int demo_render(struct notcurses* nc){
       return -1;
     }
   }
-  int ret = 0;
-  pthread_cleanup_push(unlock_mutex, &demo_render_lock);
-  // lock against a possible notcurses_refresh() on Ctrl+L
-  pthread_mutex_lock(&demo_render_lock);
-  ret = notcurses_render(nc);
-  pthread_mutex_unlock(&demo_render_lock);
-  pthread_cleanup_pop(1);
-  return ret;
-}
-
-void lock_demo_render(void){
-  pthread_mutex_lock(&demo_render_lock);
-}
-
-void unlock_demo_render(void){
-  pthread_mutex_unlock(&demo_render_lock);
+  ncinput ni;
+  char32_t id;
+  id = demo_getc_nblock(nc, &ni);
+  int ret = notcurses_render(nc);
+  if(ret){
+    return ret;
+  }
+  if(id == 'q'){
+    return 1;
+  }
+  return 0;
 }

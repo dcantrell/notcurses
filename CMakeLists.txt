@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(notcurses VERSION 1.3.0
+project(notcurses VERSION 1.3.4
   DESCRIPTION "UI for modern terminal emulators"
   HOMEPAGE_URL "https://nick-black.com/dankwiki/index.php/notcurses"
   LANGUAGES C CXX)
@@ -14,13 +14,25 @@ include(GNUInstallDirs)
 ###################### USER-SELECTABLE OPTIONS ###########################
 option(DFSG_BUILD "DFSG build (no non-free media/code)" OFF)
 option(USE_DOXYGEN "Build HTML cross reference with doxygen" OFF)
-option(USE_FFMPEG "Disable FFmpeg image/video support (recommended)" ON)
 option(USE_NETWORK "Allow cargo to use the network" OFF)
 option(USE_PANDOC "Build man pages and HTML reference with pandoc" ON)
 option(USE_PYTHON "Build Python wrappers" ON)
+option(USE_QRCODEGEN "Disable libqrcodegen QR code support" ON)
 option(USE_RUST "Build Rust wrappers (experimental)" OFF)
 option(USE_TESTS "Build doctest unit tests" ON)
+set(USE_MULTIMEDIA "ffmpeg" CACHE STRING "Multimedia engine, one of 'ffmpeg', 'oiio', or 'none'")
+set_property(CACHE USE_MULTIMEDIA PROPERTY STRINGS ffmpeg oiio none)
+message(STATUS "Requested multimedia engine: ${USE_MULTIMEDIA}")
 ############## END (additional) USER-SELECTABLE OPTIONS ##################
+set(USE_FFMPEG OFF)
+set(USE_OIIO OFF)
+if(${USE_MULTIMEDIA} STREQUAL "ffmpeg")
+  set(USE_FFMPEG ON)
+elseif(${USE_MULTIMEDIA} STREQUAL "oiio")
+  set(USE_OIIO ON)
+elseif(NOT ${USE_MULTIMEDIA} STREQUAL "none")
+  message(FATAL_ERROR "USE_MULTIMEDIA must be one of 'oiio', 'ffmpeg', 'none' (was '${USE_MULTIMEDIA}')")
+endif()
 
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
@@ -30,14 +42,16 @@ pkg_check_modules(AVCODEC REQUIRED libavcodec>=57.0)
 pkg_check_modules(AVFORMAT REQUIRED libavformat>=57.0)
 pkg_check_modules(AVUTIL REQUIRED libavutil>=56.0)
 pkg_check_modules(SWSCALE REQUIRED libswscale>=5.0)
+elseif(${USE_OIIO})
+pkg_check_modules(OIIO REQUIRED OpenImageIO>=2.1)
 endif()
 find_library(LIBRT rt)
 if(${USE_TESTS})
 find_package(doctest 2.3.5 REQUIRED)
 endif()
 
-# libnotcurses
-file(GLOB NCSRCS CONFIGURE_DEPENDS src/lib/*.c)
+# libnotcurses (core shared library and static library)
+file(GLOB NCSRCS CONFIGURE_DEPENDS src/lib/*.c src/lib/*.cpp)
 add_library(notcurses SHARED ${NCSRCS})
 add_library(notcurses-static STATIC ${NCSRCS})
 set_target_properties(
@@ -67,7 +81,6 @@ target_include_directories(notcurses-static
 )
 target_link_libraries(notcurses
   PRIVATE
-    Threads::Threads
     "${TERMINFO_LIBRARIES}"
     "${LIBRT}"
   PUBLIC
@@ -89,6 +102,11 @@ target_link_directories(notcurses-static
     "${TERMINFO_STATIC_LIBRARY_DIRS}"
 )
 
+if(${USE_QRCODEGEN})
+target_link_libraries(notcurses PRIVATE qrcodegen)
+target_link_libraries(notcurses-static PRIVATE qrcodegen)
+endif()
+
 if(${USE_FFMPEG})
 target_include_directories(notcurses
   PUBLIC
@@ -108,30 +126,41 @@ target_link_libraries(notcurses
   PRIVATE
     "${AVCODEC_LIBRARIES}"
     "${AVFORMAT_LIBRARIES}"
-    "${AVUTIL_LIBRARIES}"
     "${SWSCALE_LIBRARIES}"
+  PUBLIC
+    "${AVUTIL_LIBRARIES}"
 )
 target_link_libraries(notcurses-static
   PRIVATE
     "${AVCODEC_STATIC_LIBRARIES}"
     "${AVFORMAT_STATIC_LIBRARIES}"
-    "${AVUTIL_STATIC_LIBRARIES}"
     "${SWSCALE_STATIC_LIBRARIES}"
+  PUBLIC
+    "${AVUTIL_STATIC_LIBRARIES}"
 )
 target_link_directories(notcurses
-  PUBLIC
+  PRIVATE
     "${AVCODEC_LIBRARY_DIRS}"
     "${AVFORMAT_LIBRARY_DIRS}"
-    "${AVUTIL_LIBRARY_DIRS}"
     "${SWSCALE_LIBRARY_DIRS}"
+  PUBLIC
+    "${AVUTIL_LIBRARY_DIRS}"
 )
 target_link_directories(notcurses-static
-  PUBLIC
+  PRIVATE
     "${AVCODEC_STATIC_LIBRARY_DIRS}"
     "${AVFORMAT_STATIC_LIBRARY_DIRS}"
-    "${AVUTIL_STATIC_LIBRARY_DIRS}"
     "${SWSCALE_STATIC_LIBRARY_DIRS}"
+  PUBLIC
+    "${AVUTIL_STATIC_LIBRARY_DIRS}"
 )
+elseif(${USE_OIIO})
+target_include_directories(notcurses PUBLIC "${OIIO_INCLUDE_DIRS}")
+target_include_directories(notcurses-static PUBLIC "${OIIO_STATIC_INCLUDE_DIRS}")
+target_link_libraries(notcurses PRIVATE ${OIIO_LIBRARIES})
+target_link_libraries(notcurses-static PRIVATE ${OIIO_STATIC_LIBRARIES})
+target_link_directories(notcurses PRIVATE ${OIIO_LIBRARY_DIRS})
+target_link_directories(notcurses-static PRIVATE ${OIIO_STATIC_LIBRARY_DIRS})
 endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL Debug)
@@ -142,11 +171,11 @@ endif()
 
 target_compile_options(notcurses
   PRIVATE
-    -Wall -Wextra -W -Wshadow -Wformat -fkeep-inline-functions ${DEBUG_OPTIONS}
+    -Wall -Wextra -W -Wshadow -Wformat ${DEBUG_OPTIONS}
 )
 target_compile_options(notcurses-static
   PRIVATE
-    -Wall -Wextra -W -Wshadow -Wformat -fkeep-inline-functions ${DEBUG_OPTIONS}
+    -Wall -Wextra -W -Wshadow -Wformat ${DEBUG_OPTIONS}
 )
 target_compile_definitions(notcurses
   PUBLIC
@@ -272,17 +301,17 @@ target_compile_definitions(notcurses++-static
 file(GLOB NOTCURSES_HEADERS
   CONFIGURE_DEPENDS
   LIST_DIRECTORIES false
-  ${CMAKE_SOURCE_DIR}/include/notcurses/*.h)
+  ${PROJECT_SOURCE_DIR}/include/notcurses/*.h)
 
 file(GLOB NCPP_HEADERS
   CONFIGURE_DEPENDS
   LIST_DIRECTORIES false
-  ${CMAKE_SOURCE_DIR}/include/ncpp/*.hh)
+  ${PROJECT_SOURCE_DIR}/include/ncpp/*.hh)
 
 file(GLOB NCPP_INTERNAL_HEADERS
   CONFIGURE_DEPENDS
   LIST_DIRECTORIES false
-  ${CMAKE_SOURCE_DIR}/include/ncpp/internal/*.hh)
+  ${PROJECT_SOURCE_DIR}/include/ncpp/internal/*.hh)
 
 install(FILES ${NOTCURSES_HEADERS} DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/notcurses)
 install(FILES ${NCPP_HEADERS} DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ncpp)
@@ -383,11 +412,11 @@ if(USE_PANDOC)
     endforeach()
     foreach(m ${MANSOURCE3})
       get_filename_component(me ${m} NAME_WLE)
-      set(MANPAGES3 ${MANPAGES3} ${CMAKE_CURRENT_BINARY_DIR}/${me})
+      LIST(APPEND MANPAGES3 ${CMAKE_CURRENT_BINARY_DIR}/${me})
     endforeach()
     foreach(m ${MANSOURCE1})
       get_filename_component(me ${m} NAME_WLE)
-      set(MANPAGES1 ${MANPAGES1} ${CMAKE_CURRENT_BINARY_DIR}/${me})
+      LIST(APPEND MANPAGES1 ${CMAKE_CURRENT_BINARY_DIR}/${me})
     endforeach()
   endif()
 endif()
@@ -477,8 +506,8 @@ target_compile_definitions(notcurses-tetris
 )
 
 # notcurses-view
+if(${USE_FFMPEG} OR ${USE_OIIO})
 file(GLOB VIEWSRCS CONFIGURE_DEPENDS src/view/*.cpp)
-if(${USE_FFMPEG})
 add_executable(notcurses-view ${VIEWSRCS})
 target_include_directories(notcurses-view
   PRIVATE
@@ -529,6 +558,7 @@ target_include_directories(notcurses-tester
 target_link_libraries(notcurses-tester
   PRIVATE
     notcurses
+    "${TERMINFO_LIBRARIES}"
 )
 target_compile_options(notcurses-tester
   PRIVATE
@@ -574,43 +604,41 @@ write_basic_package_version_file(
   COMPATIBILITY SameMajorVersion
 )
 
-# Python bindings
+# Python bindings. When we're building debs, we use pybuild to directly call
+# into setup.py, so none of this applies---debian/rules sets USE_PYTHON=off.
+# arch also doesn't use it. fedora does.
 if(${USE_PYTHON})
-  # when we're building debs, we use pybuild to directly call into setup.py,
-  # so none of this applies. arch also doesn't use it. fedora does.
-  if(NOT "${DFSG_BUILD}")
-    find_package(Python3 COMPONENTS Development Interpreter REQUIRED)
-    file(GLOB PYSRC CONFIGURE_DEPENDS python/src/notcurses/*.py)
-    file(COPY python/src/ DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/python/src)
-    file(COPY python/README.md DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/python)
-    set(SETUP_PY_IN "${CMAKE_CURRENT_SOURCE_DIR}/tools/setup.py.in")
-    set(SETUP_PY "${CMAKE_CURRENT_BINARY_DIR}/python/setup.py")
-    set(SETUP_CFG_IN "${CMAKE_CURRENT_SOURCE_DIR}/tools/setup.cfg.in")
-    set(SETUP_CFG "${CMAKE_CURRENT_BINARY_DIR}/python/setup.cfg")
-    configure_file(${SETUP_PY_IN} ${SETUP_PY})
-    configure_file(${SETUP_CFG_IN} ${SETUP_CFG})
-    add_custom_command(
-      OUTPUT
-        "${CMAKE_CURRENT_BINARY_DIR}/build/pytimestamp"
-      COMMAND
-        env LDFLAGS="-L${CMAKE_CURRENT_BINARY_DIR}" "${Python3_EXECUTABLE}" ${SETUP_PY} build &&
-        "${Python3_EXECUTABLE}" ${SETUP_PY} egg_info
-      DEPENDS
-        ${PYSRC} ${SETUP_PY} ${SETUP_CFG} notcurses
-      COMMENT "Building Python wrappers"
-      WORKING_DIRECTORY
-        ${CMAKE_CURRENT_BINARY_DIR}/python
-    )
-    # build/pytimestamp isn't actually generated, and thus this runs each time.
-    # python does its own dep tracking, so it "works" out like recursive make.
-    add_custom_target(pymod ALL
-      DEPENDS
-        "${CMAKE_CURRENT_BINARY_DIR}/build/pytimestamp"
-      WORKING_DIRECTORY
-        ${CMAKE_CURRENT_BINARY_DIR}/python
-    )
+  find_package(Python3 COMPONENTS Development Interpreter REQUIRED)
+  file(GLOB PYSRC CONFIGURE_DEPENDS python/src/notcurses/*.py)
+  file(COPY python/src/ DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/python/src)
+  file(COPY python/README.md DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/python)
+  set(SETUP_PY_IN "${CMAKE_CURRENT_SOURCE_DIR}/tools/setup.py.in")
+  set(SETUP_PY "${CMAKE_CURRENT_BINARY_DIR}/python/setup.py")
+  set(SETUP_CFG_IN "${CMAKE_CURRENT_SOURCE_DIR}/tools/setup.cfg.in")
+  set(SETUP_CFG "${CMAKE_CURRENT_BINARY_DIR}/python/setup.cfg")
+  configure_file(${SETUP_PY_IN} ${SETUP_PY})
+  configure_file(${SETUP_CFG_IN} ${SETUP_CFG})
+  add_custom_command(
+    OUTPUT
+      "${CMAKE_CURRENT_BINARY_DIR}/build/pytimestamp"
+    COMMAND
+      env LDFLAGS=\"-Wl,-soname,_notcurses.abi3.so.1 -L${CMAKE_CURRENT_BINARY_DIR}\" "${Python3_EXECUTABLE}" ${SETUP_PY} build &&
+      "${Python3_EXECUTABLE}" ${SETUP_PY} egg_info
+    DEPENDS
+      ${PYSRC} ${SETUP_PY} ${SETUP_CFG} notcurses
+    COMMENT "Building Python wrappers"
+    WORKING_DIRECTORY
+      ${CMAKE_CURRENT_BINARY_DIR}/python
+  )
+  # build/pytimestamp isn't actually generated, and thus this runs each time.
+  # python does its own dep tracking, so it "works" out like recursive make.
+  add_custom_target(pymod ALL
+    DEPENDS
+      "${CMAKE_CURRENT_BINARY_DIR}/build/pytimestamp"
+    WORKING_DIRECTORY
+      ${CMAKE_CURRENT_BINARY_DIR}/python
+  )
   install(CODE "execute_process(COMMAND ${Python3_EXECUTABLE} setup.py install --prefix=${CMAKE_INSTALL_PREFIX} WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/python)")
-  endif()
 endif()
 
 # Rust bindings
@@ -668,22 +696,18 @@ install(FILES
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
 )
 
-if(${USE_FFMPEG})
+if(${USE_FFMPEG} OR ${USE_OIIO})
 file(GLOB TESTDATA CONFIGURE_DEPENDS data/*)
-install(FILES
-  ${TESTDATA}
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/notcurses
-)
+# Don't install source materia for self-originated multimedia
+list(FILTER TESTDATA EXCLUDE REGEX ".*xcf$")
+list(FILTER TESTDATA EXCLUDE REGEX ".*osp$")
+install(FILES ${TESTDATA} DESTINATION ${CMAKE_INSTALL_DATADIR}/notcurses)
 endif()
 
-install(FILES
-  ${MANPAGES1}
-    DESTINATION ${CMAKE_INSTALL_PREFIX}/share/man/man1
-)
-install(FILES
-  ${MANPAGES3}
-    DESTINATION ${CMAKE_INSTALL_PREFIX}/share/man/man3
-)
+install(FILES ${MANPAGES1} DESTINATION ${CMAKE_INSTALL_PREFIX}/share/man/man1)
+install(FILES ${MANPAGES3} DESTINATION ${CMAKE_INSTALL_PREFIX}/share/man/man3)
+file(GLOB MARKDOWN CONFIGURE_DEPENDS *.md)
+install(FILES ${MARKDOWN} DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 install(PROGRAMS src/pydemo/notcurses-pydemo DESTINATION bin)
 install(TARGETS notcurses-demo DESTINATION bin)
@@ -693,7 +717,7 @@ if(${USE_TESTS})
 install(TARGETS notcurses-tester DESTINATION bin)
 endif()
 install(TARGETS notcurses-tetris DESTINATION bin)
-if(${USE_FFMPEG})
+if(${USE_FFMPEG} OR ${USE_OIIO})
 install(TARGETS notcurses-view DESTINATION bin)
 endif()
 install(TARGETS notcurses notcurses-static
