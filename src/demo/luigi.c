@@ -112,29 +112,28 @@ static const char* luigis[] = {
 static int
 draw_luigi(struct ncplane* n, const char* sprite){
   uint64_t channels = 0;
-  channels_set_fg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
-  channels_set_bg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
+  ncchannels_set_fg_alpha(&channels, NCALPHA_TRANSPARENT);
+  ncchannels_set_bg_alpha(&channels, NCALPHA_TRANSPARENT);
   ncplane_set_base(n, "", 0, channels);
   size_t s;
-  int sbytes;
   // optimization so we can elide more color changes, see README's "#perf"
-  ncplane_set_bg_rgb(n, 0x00, 0x00, 0x00);
+  ncplane_set_bg_rgb8(n, 0x00, 0x00, 0x00);
   for(s = 0 ; sprite[s] ; ++s){
     switch(sprite[s]){
       case '0':
         break;
       case '1':
-        ncplane_set_fg_rgb(n, 0xff, 0xff, 0xff);
+        ncplane_set_bg_rgb8(n, 0xff, 0xff, 0xff);
         break;
       case '2':
-        ncplane_set_fg_rgb(n, 0xe3, 0x9d, 0x25);
+        ncplane_set_bg_rgb8(n, 0xe3, 0x9d, 0x25);
         break;
       case '3':
-        ncplane_set_fg_rgb(n, 0x3a, 0x84, 0x00);
+        ncplane_set_bg_rgb8(n, 0x3a, 0x84, 0x00);
         break;
     }
     if(sprite[s] != '0'){
-      if(ncplane_putegc_yx(n, s / 16, s % 16, "\u2588", &sbytes) != 1){
+      if(ncplane_putegc_yx(n, s / 16, s % 16, " ", NULL) != 1){
         return -1;
       }
     }
@@ -142,36 +141,42 @@ draw_luigi(struct ncplane* n, const char* sprite){
   return 0;
 }
 
-int luigi_demo(struct notcurses* nc){
-  if(!notcurses_canopen(nc)){
+int luigi_demo(struct notcurses* nc, uint64_t startns){
+  (void)startns;
+  if(!notcurses_canopen_images(nc)){
     return 0;
   }
-  int rows, cols;
-  struct ncplane* n = notcurses_stddim_yx(nc, &rows, &cols);
-  nc_err_e ncerr = NCERR_SUCCESS;
+  unsigned rows, cols;
   char* map = find_data("megaman2.bmp");
-  struct ncvisual* nv = ncplane_visual_open(n, map, &ncerr);
+  struct ncvisual* nv = ncvisual_from_file(map);
   free(map);
   if(nv == NULL){
     return -1;
   }
-  if((ncerr = ncvisual_decode(nv)) != NCERR_SUCCESS){
+  struct ncvisual_options vopts = {
+    .n = notcurses_stddim_yx(nc, &rows, &cols),
+    .scaling = NCSCALE_STRETCH,
+    .flags = NCVISUAL_OPTION_NOINTERPOLATE,
+  };
+  if(ncvisual_blit(nc, nv, &vopts) == NULL){
     return -1;
   }
-  if(ncvisual_render(nv, 0, 0, -1, -1) <= 0){
-    return -1;
-  }
-  assert(NCERR_EOF == ncvisual_decode(nv));
+  assert(1 == ncvisual_decode(nv));
   // he should be walking on the platform ~4/5 of the way down
   const int height = 32;
   int yoff = rows * 4 / 5 - height + 1; // tuned
   struct ncplane* lns[3];
-  int i;
+  unsigned i;
   struct ncplane* lastseen = NULL;
   for(i = 0 ; i < 3 ; ++i){
-    lns[i] = ncplane_new(nc, height, 16, yoff, 0, NULL);
+    struct ncplane_options nopts = {
+      .y = yoff,
+      .rows = height,
+      .cols = 16,
+    };
+    lns[i] = ncplane_create(notcurses_stdplane(nc), &nopts);
     if(lns[i] == NULL){
-      while(--i){
+      while(i--){
         ncplane_destroy(lns[i]);
       }
       return -1;
@@ -187,23 +192,24 @@ int luigi_demo(struct notcurses* nc){
   if(fname == NULL){
     return -1;
   }
-  wmncv = ncvisual_open_plane(nc, fname, &ncerr, 0, 0, NCSCALE_NONE);
+  wmncv = ncvisual_from_file(fname);
   free(fname);
   if(wmncv == NULL){
     return -1;
   }
-  if((ncerr = ncvisual_decode(wmncv)) != NCERR_SUCCESS){
-    ncvisual_destroy(wmncv);
-    return -1;
-  }
   uint64_t channels = 0;
-  channels_set_fg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
-  channels_set_bg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
-  ncplane_set_base(ncvisual_plane(wmncv), "", 0, channels);
-  if(ncvisual_render(wmncv, 0, 0, -1, -1) <= 0){
+  ncchannels_set_fg_alpha(&channels, NCALPHA_TRANSPARENT);
+  ncchannels_set_bg_alpha(&channels, NCALPHA_TRANSPARENT);
+  struct ncvisual_options wvopts = {
+    .n = notcurses_stdplane(nc),
+    .flags = NCVISUAL_OPTION_CHILDPLANE,
+  };
+  struct ncplane* wmplane = ncvisual_blit(nc, wmncv, &wvopts);
+  if(wmplane == NULL){
     ncvisual_destroy(wmncv);
     return -1;
   }
+  ncplane_set_base(wmplane, "", 0, channels);
   for(i = 0 ; i < cols - 16 - 1 + 50 ; ++i){
     if(i + 16 >= cols - 16 - 1){
       --yoff;
@@ -213,14 +219,18 @@ int luigi_demo(struct notcurses* nc){
       ncplane_move_top(lastseen);
     }
     ncplane_move_yx(lastseen, yoff, i);
-    int dimy = ncplane_dim_y(ncvisual_plane(wmncv));
-    ncplane_move_yx(ncvisual_plane(wmncv), rows * 4 / 5 - dimy + 1 + (i % 2), i - 60);
+    ncvgeom geom;
+    ncvisual_geom(nc, wmncv, NULL, &geom);
+    geom.pixy /= geom.scaley;
+    // FIXME what the fuck is this
+    ncplane_move_yx(wmplane, rows * 4 / 5 - geom.pixy + 1 + (i % 2), i - 60);
     DEMO_RENDER(nc);
     demo_nanosleep(nc, &stepdelay);
   }
   for(i = 0 ; i < 3 ; ++i){
     ncplane_destroy(lns[i]);
   }
+  ncplane_destroy(wmplane);
   ncvisual_destroy(nv);
   ncvisual_destroy(wmncv);
   return 0;

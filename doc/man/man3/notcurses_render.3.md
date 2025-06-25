@@ -1,31 +1,60 @@
 % notcurses_render(3)
 % nick black <nickblack@linux.com>
-% v1.3.3
+% v3.0.16
 
 # NAME
 
-notcurses_render - sync the physical display to the virtual ncplanes
+notcurses_render - sync the physical display to a virtual pile
 
 # SYNOPSIS
 
 **#include <notcurses/notcurses.h>**
 
-**int notcurses_render(struct notcurses* nc);**
+**int ncpile_render(struct ncplane* n);**
 
-**char* notcurses_at_yx(struct notcurses* nc, int yoff, int xoff, uint32_t* attrword, uint64_t* channels);**
+**int ncpile_rasterize(struct ncplane* n);**
+
+**int notcurses_render(struct notcurses* ***nc***);**
+
+**char* notcurses_at_yx(struct notcurses* ***nc***, unsigned ***yoff***, unsigned ***xoff***, uint16_t* ***styles***, uint64_t* ***channels***);**
+
+**int ncpile_render_to_file(struct ncplane* ***p***, FILE* ***fp***);**
+
+**int ncpile_render_to_buffer(struct ncplane* ***p***, char\*\* ***buf***, size_t* ***buflen***);**
 
 # DESCRIPTION
 
-**notcurses_render** syncs the physical display to the context's prepared
-ncplanes. It is necessary to call **notcurses_render** to generate any visible
-output; the various notcurses_output(3) calls only draw to the virtual
-ncplanes. Most of the notcurses statistics are updated as a result of a
-render (see notcurses_stats(3)), and screen geometry is refreshed (similarly to
-**notcurses_refresh**) *following* the render.
+Rendering reduces a pile of **ncplane**s to a single plane, proceeding from the
+top to the bottom along a pile's z-axis. The result is a matrix of **nccell**s
+(see **notcurses_cell**). Rasterizing takes this matrix, together with the
+current state of the visual area, and produces a stream of optimized control
+sequences and EGCs for the terminal. By writing this stream to the terminal,
+the physical display is synced to some pile's planes.
+
+**ncpile_render** performs the first of these tasks for the pile of which **n**
+is a part. The output is maintained internally; calling **ncpile_render** again
+on the same pile will replace this state with a fresh render. Multiple piles
+can be concurrently rendered. **ncpile_rasterize** performs rasterization, and
+writes the result to the terminal. It is a blocking call, and only one
+rasterization operation may proceed at a time. **notcurses_render** calls
+**ncpile_render** and **ncpile_rasterize** on the standard plane, for backwards
+compatibility. It is an exclusive blocking call.
+
+It is necessary to call **ncpile_rasterize** or **notcurses_render** to
+generate any visible output; the various notcurses_output(3) calls only draw to
+the virtual ncplanes. Most of the notcurses statistics are updated as a result
+of a render (see **notcurses_stats(3)**), and screen geometry is refreshed
+(similarly to **notcurses_refresh(3)**) *following* the render.
 
 While **notcurses_render** is called, you **must not call any other functions
-on the same notcurses context**, with the one exception of **notcurses_getc**
-(and its input-related helpers).
+modifying the same pile**. Other piles may be freely accessed and modified.
+The pile being rendered may be accessed, but not modified.
+
+**ncpile_render_to_buffer** performs the render and raster processes of
+**ncpile_render** and **ncpile_rasterize**, but does not write the resulting
+buffer to the terminal. The user is responsible for writing the buffer to the
+terminal in its entirety. If there is an error, subsequent frames will be out
+of sync, and **notcurses_refresh(3)** must be called.
 
 A render operation consists of two logical phases: generation of the rendered
 scene, and blitting this scene to the terminal (these two phases might actually
@@ -34,9 +63,7 @@ requires determining an extended grapheme cluster, foreground color, background
 color, and style for each cell of the physical terminal. Writing the scene
 requires synthesizing a set of UTF-8-encoded characters and escape codes
 appropriate for the terminal (relying on terminfo(5)), and writing this
-sequence to the output **FILE**. If the **renderfp** value was not NULL in the
-original call to **notcurses_init**, the frame will be written to that **FILE**
-as well. This write does not affect statistics.
+sequence to the output **FILE**.
 
 Each cell can be rendered in isolation, though synthesis of the stream carries
 dependencies between cells.
@@ -56,15 +83,16 @@ At each plane **P**, we consider a cell **C**. This cell is the intersecting cel
 unless that cell has no EGC. In that case, **C** is the plane's default cell.
 
 * If we have not yet determined an EGC, and **C** has a non-zero EGC, use the EGC and style of **C**.
-* If we have not yet locked in a foreground color, and **C** is not foreground-transparent, use the foreground color of **C** (see [BUGS][] below). If **C** is **CELL_ALPHA_OPAQUE**, lock the color in.
-* If we have not yet locked in a background color, and **C** is not background-transparent, use the background color of **C** (see [BUGS][] below). If **C** is **CELL_ALPHA_OPAQUE**, lock the color in.
+* If we have not yet locked in a foreground color, and **C** is not foreground-transparent, use the foreground color of **C** (see [BUGS][] below). If **C** is **NCALPHA_OPAQUE**, lock the color in.
+* If we have not yet locked in a background color, and **C** is not background-transparent, use the background color of **C** (see [BUGS][] below). If **C** is **NCALPHA_OPAQUE**, lock the color in.
 
 If the algorithm concludes without an EGC, the cell is rendered with no glyph
 and a default background. If the algorithm concludes without a color locked in,
 the color as computed thus far is used.
 
-**notcurses_at_yx** retrieves a call *as rendered*. The EGC in that cell is
-copied and returned; it must be **free(3)**d by the caller.
+**notcurses_at_yx** retrieves a cell *as rendered*. The EGC in that cell is
+copied and returned; it must be **free(3)**d by the caller. If the cell is a
+secondary column of a wide glyph, the glyph is still returned.
 
 # RETURN VALUES
 
@@ -84,6 +112,13 @@ purposes of color blending.
 
 # SEE ALSO
 
-**notcurses(3)**, **notcurses_cell(3)**, **notcurses_ncplane(3)**,
-**notcurses_output(3)**, **notcurses_refresh(3)**, **notcurses_stats(3)**,
-**console_codes(4)**, **utf-8(7)**
+**notcurses(3)**,
+**notcurses_cell(3)**,
+**notcurses_input(3)**,
+**notcurses_output(3)**,
+**notcurses_plane(3)**,
+**notcurses_refresh(3)**,
+**notcurses_stats(3)**,
+**notcurses_visual(3)**,
+**console_codes(4)**,
+**utf-8(7)**

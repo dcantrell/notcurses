@@ -60,56 +60,79 @@ generate_next_color(unsigned *total, unsigned *r, unsigned *g, unsigned *b,
   return ret;
 }
 
-int highcontrast_demo(struct notcurses* nc){
+int highcon_demo(struct notcurses* nc, uint64_t startns){
+  (void)startns;
   const int STEP = 16;
   int ret = -1;
-  int dimy, dimx;
+  unsigned dimy, dimx;
   struct ncplane* n = notcurses_stddim_yx(nc, &dimy, &dimx);
   int totcells = (dimy - 1) * dimx;
+  if(totcells <= 1){
+    return -1;
+  }
   unsigned* scrcolors = malloc(sizeof(*scrcolors) * totcells);
   if(scrcolors == NULL){
     return -1;
   }
-  const char motto[] = " high contrast text ";
-  cell c = CELL_TRIVIAL_INITIALIZER;
-  cell_set_fg_alpha(&c, CELL_ALPHA_HIGHCONTRAST);
+  const char motto[] = " high contrast text is evaluated relative to the solved background";
+  nccell c = NCCELL_TRIVIAL_INITIALIZER;
   unsigned total = 0, r = 0, g = 0, b = 0;
   for(int out = 0 ; out < totcells ; ++out){ // build up the initial screen
     scrcolors[out] = generate_next_color(&total, &r, &g, &b, STEP);
     if(total > 768){
       total = r = g = b = 0;
     }
-    cell_load_simple(n, &c, motto[out % strlen(motto)]);
-    cell_set_bg(&c, scrcolors[out % totcells]);
+    nccell_load_char(n, &c, motto[out % strlen(motto)]);
+    nccell_set_fg_alpha(&c, NCALPHA_HIGHCONTRAST);
+    nccell_set_bg_rgb(&c, scrcolors[out % totcells]);
     if(ncplane_putc_yx(n, (out + dimx) / dimx, out % dimx, &c) < 0){
+      free(scrcolors);
       goto err;
     }
   }
+  free(scrcolors);
   // each iteration, "draw the background in" one cell from the top left and
   // bottom right.
   int offset = 0;
+  struct timespec start;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  uint64_t totalns = timespec_to_ns(&demodelay) * 2;
+  uint64_t iterns = totalns / (totcells / 2);
   do{
     if(offset){
-      cell_set_fg_alpha(&c, CELL_ALPHA_OPAQUE);
+      nccell_set_fg_alpha(&c, NCALPHA_OPAQUE);
       const int f = offset - 1 + dimx;
       const int l = totcells + dimx - offset;
-      cell_load_simple(n, &c, motto[f % strlen(motto)]);
-      cell_set_fg(&c, 0x004000 + (16 * offset));
-      cell_set_bg(&c, 0);
+      ncplane_at_yx_cell(n, f / dimx, f % dimx, &c);
+      nccell_set_fg_rgb(&c, 0x004000 + (16 * offset));
+      nccell_set_bg_rgb(&c, 0);
+      nccell_set_fg_alpha(&c, NCALPHA_OPAQUE);
       if(ncplane_putc_yx(n, f / dimx, f % dimx, &c) < 0){
         goto err;
       }
-      cell_load_simple(n, &c, motto[l % strlen(motto)]);
+      ncplane_at_yx_cell(n, l / dimx, l % dimx, &c);
+      nccell_set_fg_rgb(&c, 0x004000 + (16 * offset));
+      nccell_set_bg_rgb(&c, 0);
+      nccell_set_fg_alpha(&c, NCALPHA_OPAQUE);
       if(ncplane_putc_yx(n, l / dimx, l % dimx, &c) < 0){
         goto err;
       }
     }
     DEMO_RENDER(nc);
-  }while(++offset < totcells / 2);
+    uint64_t targns = timespec_to_ns(&start) + offset * iterns;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if(targns > timespec_to_ns(&now)){
+      struct timespec abstime;
+      ns_to_timespec(targns, &abstime);
+      if((ret = demo_nanosleep_abstime(nc, &abstime))){
+          goto err;
+      }
+    }
+  }while(++offset <= totcells / 2);
   ret = 0;
 
 err:
-  cell_release(n, &c);
-  free(scrcolors);
+  nccell_release(n, &c);
   return ret;
 }

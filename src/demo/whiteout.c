@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <unictype.h>
 #include "demo.h"
 
 // Fill up the screen with as much crazy Unicode as we can, and then set a
@@ -12,18 +13,25 @@
 
 static struct ncplane*
 mathplane(struct notcurses* nc){
-  int dimx, dimy;
+  struct ncplane* stdn = notcurses_stdplane(nc);
+  unsigned dimx, dimy;
   notcurses_term_dim_yx(nc, &dimy, &dimx);
   const int HEIGHT = 9;
   const int WIDTH = dimx;
-  struct ncplane* n = ncplane_new(nc, HEIGHT, WIDTH, dimy - HEIGHT - 1, dimx - WIDTH, NULL);
+  struct ncplane_options nopts = {
+    .y = dimy - HEIGHT - 1,
+    .x = dimx - WIDTH,
+    .rows = HEIGHT,
+    .cols = WIDTH,
+  };
+  struct ncplane* n = ncplane_create(stdn, &nopts);
   uint64_t channels = 0;
-  channels_set_fg(&channels, 0x2b50c8); // metallic gold, inverted
-  channels_set_fg_alpha(&channels, CELL_ALPHA_BLEND);
-  channels_set_bg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
+  ncchannels_set_fg_rgb(&channels, 0x2b50c8); // metallic gold, inverted
+  ncchannels_set_fg_alpha(&channels, NCALPHA_BLEND);
+  ncchannels_set_bg_alpha(&channels, NCALPHA_TRANSPARENT);
   ncplane_set_base(n, "", 0, channels);
-  ncplane_set_fg(n, 0xd4af37); // metallic gold
-  ncplane_set_bg(n, 0x0);
+  ncplane_set_fg_rgb(n, 0xd4af37); // metallic gold
+  ncplane_set_bg_rgb(n, 0x0);
   if(n){
     ncplane_printf_aligned(n, 0, NCALIGN_RIGHT, "∮E⋅da=Q,n→∞,∑f(i)=∏g(i)⎧⎡⎛       ⎞⎤⎫");
     ncplane_printf_aligned(n, 1, NCALIGN_RIGHT, "⎪⎢⎜ 8πG   ⎟⎥⎪");
@@ -40,44 +48,37 @@ mathplane(struct notcurses* nc){
 
 // the closer the coordinate is (lower distance), the more we lighten the cell
 static inline int
-lighten(struct ncplane* n, cell* c, int distance, int y, int x){
-  if(cell_wide_right_p(c)){ // not really a character
+lighten(struct ncplane* n, nccell* c, int distance, int y, int x){
+  if(nccell_wide_right_p(c)){ // not really a character
     return 0;
   }
   unsigned r, g, b;
-  cell_fg_rgb(c, &r, &g, &b);
+  nccell_fg_rgb8(c, &r, &g, &b);
   r += rand() % (64 / (2 * distance + 1) + 1);
   g += rand() % (64 / (2 * distance + 1) + 1);
   b += rand() % (64 / (2 * distance + 1) + 1);
-  cell_set_fg_rgb_clipped(c, r, g, b);
+  nccell_set_fg_rgb8_clipped(c, r, g, b);
   return ncplane_putc_yx(n, y, x, c);
 }
 
-static void
-surrounding_cells(struct ncplane* n, cell* lightup, int y, int x){
-  ncplane_at_yx_cell(n, y, x, lightup);
-}
-
-static int
-lightup_surrounding_cells(struct ncplane* n, const cell* lightup, int y, int x){
-  cell c = CELL_TRIVIAL_INITIALIZER;
-  cell_duplicate(n, &c, lightup);
-  lighten(n, &c, 0, y, x);
-  cell_release(n, &c);
+static inline int
+lightup_surrounding_cells(struct ncplane* n, nccell* lightup, int y, int x){
+  lighten(n, lightup, 0, y, x);
+  nccell_release(n, lightup);
   return 0;
 }
 
 typedef struct worm {
-  cell lightup;
+  nccell lightup;
   int x, y;
   int prevx, prevy;
 } worm;
 
 static void
 init_worm(worm* s, int dimy, int dimx){
-  cell_init(&s->lightup);
-  s->y = random() % dimy;
-  s->x = random() % dimx;
+  nccell_init(&s->lightup);
+  s->y = rand() % dimy;
+  s->x = rand() % dimx;
   s->prevx = 0;
   s->prevy = 0;
 }
@@ -85,7 +86,7 @@ init_worm(worm* s, int dimy, int dimx){
 static int
 wormy_top(struct notcurses* nc, worm* s){
   struct ncplane* n = notcurses_stdplane(nc);
-  surrounding_cells(n, &s->lightup, s->y, s->x);
+  ncplane_at_yx_cell(n, s->y, s->x, &s->lightup);
   if(lightup_surrounding_cells(n, &s->lightup, s->y, s->x)){
     return -1;
   }
@@ -100,7 +101,7 @@ wormy(worm* s, int dimy, int dimx){
   do{ // force a move
     s->y = oldy;
     s->x = oldx;
-    int direction = random() % 4;
+    int direction = rand() % 4;
     switch(direction){
       case 0: --s->y; break;
       case 1: ++s->x; break;
@@ -167,14 +168,14 @@ static int
 message(struct ncplane* n, int maxy, int maxx, int num, int total,
         int bytes_out, int egs_out, int cols_out){
   uint64_t channels = 0;
-  channels_set_fg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
-  channels_set_bg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
+  ncchannels_set_fg_alpha(&channels, NCALPHA_TRANSPARENT);
+  ncchannels_set_bg_alpha(&channels, NCALPHA_TRANSPARENT);
   ncplane_set_base(n, "", 0, channels);
-  ncplane_set_fg_rgb(n, 255, 255, 255);
-  ncplane_set_bg_rgb(n, 32, 64, 32);
+  ncplane_set_fg_rgb8(n, 255, 255, 255);
+  ncplane_set_bg_rgb8(n, 32, 64, 32);
   channels = 0;
-  channels_set_fg_rgb(&channels, 255, 255, 255);
-  channels_set_bg_rgb(&channels, 32, 64, 32);
+  ncchannels_set_fg_rgb8(&channels, 255, 255, 255);
+  ncchannels_set_bg_rgb8(&channels, 32, 64, 32);
   ncplane_cursor_move_yx(n, 2, 0);
   if(ncplane_rounded_box(n, 0, channels, 4, 56, 0)){
     return -1;
@@ -183,10 +184,10 @@ message(struct ncplane* n, int maxy, int maxx, int num, int total,
   ncplane_putegc_yx(n, 4, 17, "┬", NULL);
   ncplane_putegc_yx(n, 5, 17, "│", NULL);
   ncplane_putegc_yx(n, 6, 17, "╰", NULL);
-  cell hl = CELL_TRIVIAL_INITIALIZER;
-  cell_load(n, &hl, "─");
-  cell_set_fg_rgb(&hl, 255, 255, 255);
-  cell_set_bg_rgb(&hl, 32, 64, 32);
+  nccell hl = NCCELL_TRIVIAL_INITIALIZER;
+  nccell_load(n, &hl, "─");
+  nccell_set_fg_rgb8(&hl, 255, 255, 255);
+  nccell_set_bg_rgb8(&hl, 32, 64, 32);
   ncplane_hline(n, &hl, 57 - 18 - 1);
   ncplane_putegc_yx(n, 6, 56, "╯", NULL);
   ncplane_putegc_yx(n, 5, 56, "│", NULL);
@@ -196,26 +197,71 @@ message(struct ncplane* n, int maxy, int maxx, int num, int total,
   ncplane_putegc_yx(n, 2, 3, "╨", NULL);
   ncplane_putegc_yx(n, 1, 3, "║", NULL);
   ncplane_putegc_yx(n, 0, 3, "╔", NULL);
-  cell_load(n, &hl, "═");
+  nccell_load(n, &hl, "═");
   ncplane_hline(n, &hl, 20 - 4 - 1);
-  cell_release(n, &hl);
+  nccell_release(n, &hl);
   ncplane_putegc_yx(n, 0, 19, "╗", NULL);
   ncplane_putegc_yx(n, 1, 19, "║", NULL);
   ncplane_putegc_yx(n, 2, 19, "╨", NULL);
-  ncplane_set_fg_rgb(n, 64, 128, 240);
-  ncplane_set_bg_rgb(n, 32, 64, 32);
-  ncplane_styles_on(n, NCSTYLE_ITALIC);
+  ncplane_set_fg_rgb8(n, 64, 128, 240);
+  ncplane_set_bg_rgb8(n, 32, 64, 32);
+  ncplane_on_styles(n, NCSTYLE_ITALIC);
   ncplane_printf_yx(n, 5, 18, " bytes: %05d EGCs: %05d cols: %05d ", bytes_out, egs_out, cols_out);
   ncplane_printf_yx(n, 1, 4, " %03dx%03d (%d/%d) ", maxx, maxy, num + 1, total);
-  ncplane_styles_off(n, NCSTYLE_ITALIC);
-  ncplane_set_fg_rgb(n, 224, 128, 224);
-  ncplane_putstr_yx(n, 3, 1, "   🔥 unicode 13, resize awareness, 24b truecolor…🔥   ");
-  ncplane_set_fg_rgb(n, 255, 255, 255);
+  ncplane_off_styles(n, NCSTYLE_ITALIC);
+  ncplane_set_fg_rgb8(n, 224, 128, 224);
+  ncplane_putstr_yx(n, 3, 1, " 🎆🔥 unicode 16, resize awareness, 24b truecolor…🔥🎆 ");
+  ncplane_set_fg_rgb8(n, 255, 255, 255);
+  return 0;
+}
+
+// print the EGCs of the UTF8 string on the standard plane, wrapping around
+// the borders. the plane is not set to scroll, so we handle it ourselves.
+static int
+dostring(struct ncplane* n, const char** s, uint32_t rgb,
+         unsigned maxy, unsigned maxx,
+         unsigned* egcs, unsigned* cols, unsigned* bytes){
+  size_t idx = 0;
+  unsigned y, x;
+  ncplane_cursor_yx(n, &y, &x);
+  while((*s)[idx]){ // each multibyte char of string
+    if(ncplane_set_fg_rgb8(n, ncchannel_r(rgb), ncchannel_g(rgb), ncchannel_b(rgb))){
+      return -1;
+    }
+    if(x >= maxx){
+      x = 0;
+      ++y;
+    }
+    if(y >= maxy){
+      break;
+    }
+    wchar_t wcs;
+    mbstate_t mbstate;
+    memset(&mbstate, 0, sizeof(mbstate));
+    int eaten = mbrtowc(&wcs, &(*s)[idx], MB_CUR_MAX + 1, &mbstate);
+    if(eaten < 0){
+      return -1;
+    }
+    if(iswspace(wcs)){
+      idx += eaten;
+      continue;
+    }
+    size_t ulen = 0;
+    int r = 0;
+    if((r = ncplane_putegc(n, &(*s)[idx], &ulen)) <= 0){
+      return 0;
+    }
+    ncplane_cursor_yx(n, &y, &x);
+    idx += ulen;
+    *bytes += ulen;
+    *cols += r;
+    ++*egcs;
+  }
   return 0;
 }
 
 // Much of this text comes from http://kermitproject.org/utf8.html
-int witherworm_demo(struct notcurses* nc){
+int whiteout_demo(struct notcurses* nc, uint64_t startns){
   static const char* strs[] = {
     "Война и мир",
     "Бра́тья Карама́зовы",
@@ -294,8 +340,6 @@ int witherworm_demo(struct notcurses* nc){
     "ብርሃነ ዘርኣይ",
     "ኃይሌ ገብረሥላሴ",
     "ᓱᒻᒪᓂᒃᑯᐊ ᐃᓄᑦᑎᑐᑐᐃᓐᓇᔭᙱᓚᑦ",
-    "∮ E⋅da = Q,  n → ∞, ∑ f(i) = ∏ g(i), ∀x∈ℝ: ⌈x⌉ = −⌊−x⌋, α ∧ ¬β = ¬(¬α ∨ β)"
-    "2H₂ + O₂ ⇌ 2H₂O, R = 4.7 kΩ, ⌀ 200mm",
     "ði ıntəˈnæʃənəl fəˈnɛtık əsoʊsiˈeıʃn",
     "((V⍳V)=⍳⍴V)/V←,V    ⌷←⍳→⍴∆∇⊃‾⍎⍕⌈",
     "Eڿᛯℇ✈ಅΐʐ𝍇Щঅ℻ ⌬⌨ ⌣₰ ⠝ ‱ ‽ ח ֆ ∜ ⨀ ĲႪ ⇠ ਐ ῼ இ ╁ ଠ ୭ ⅙ ㈣⧒ ₔ ⅷ ﭗ ゛〃・ ↂ ﻩ ✞ ℼ ⌧",
@@ -356,6 +400,7 @@ int witherworm_demo(struct notcurses* nc){
     "Jeg kan spise glas, det gør ikke ondt på mig",
     "㎚㎛㎜㎝㎞㎟㎠㎡㎢㎣㎤㎥㎦㎕㎖㎗㎘㏄㎰㎱㎲㎳㎍㎎㎏㎅㎆㏔㎇㎐㎑㎒㎓㎔㎮㎯",
     "Æ ka æe glass uhen at det go mæ naue",
+    // FIXME this one
     "က္ယ္ဝန္တော္၊က္ယ္ဝန္မ မ္ယက္စားနုိင္သည္။ ၎က္ရောင္ ထိခုိက္မ္ဟု မရ္ဟိပာ။",
     "ကျွန်တော် ကျွန်မ မှန်စားနိုင်တယ်။ ၎င်းကြောင့် ထိခိုက်မှုမရှိပါ။ ",
     "Tôi có thể ăn thủy tinh mà không hại gì",
@@ -449,91 +494,64 @@ int witherworm_demo(struct notcurses* nc){
   const int steps[] = { 0, 0x10040, 0x20110, 0x120, 0x12020, };
   const int starts[] = { 0, 0x10101, 0x004000, 0x000040, 0x400040, };
 
+  // this demo is completely meaningless outside UTF-8 mode
+  if(!notcurses_canutf8(nc)){
+    return 0;
+  }
   size_t i;
   const size_t screens = sizeof(steps) / sizeof(*steps);
   struct ncplane* n = notcurses_stdplane(nc);
+  bool initial_scroll = ncplane_scrolling_p(n);
   ncplane_set_scrolling(n, true);
   ncplane_erase(n);
+  (void)startns; // FIXME integrate
   for(i = 0 ; i < screens ; ++i){
-    wchar_t key = NCKEY_INVALID;
-    cell c;
+    uint32_t key = NCKEY_INVALID;
+    nccell c;
     struct timespec screenend;
     clock_gettime(CLOCK_MONOTONIC, &screenend);
-    ns_to_timespec(timespec_to_ns(&screenend) + 2 * timespec_to_ns(&demodelay), &screenend);
+    ns_to_timespec(timespec_to_ns(&screenend) + timespec_to_ns(&demodelay), &screenend);
     do{ // (re)draw a screen
       const int start = starts[i];
       int step = steps[i];
-      cell_init(&c);
-      int y, x, maxy, maxx;
+      nccell_init(&c);
+      unsigned maxy, maxx;
       ncplane_dim_yx(n, &maxy, &maxx); // might resize
-      int rgb = start;
-      int bytes_out = 0;
-      int egcs_out = 0;
-      int cols_out = 0;
-      y = 1;
-      x = 0;
+      uint32_t rgb = start;
+      unsigned bytes_out = 0;
+      unsigned egcs_out = 0;
+      unsigned cols_out = 0;
+      unsigned y = 1;
+      unsigned x = 0;
       if(ncplane_cursor_move_yx(n, y, x)){
         return -1;
       }
-      ncplane_set_bg_rgb(n, 20, 20, 20);
+      ncplane_set_bg_rgb8(n, 20, 20, 20);
       do{ // we fill up the screen, however large, bouncing around our strtable
-        s = strs + random() % ((sizeof(strs) / sizeof(*strs)) - 1);
-        size_t idx = 0;
-        ncplane_cursor_yx(n, &y, &x);
-        while((*s)[idx]){ // each multibyte char of string
-          if(ncplane_set_fg_rgb(n, channel_r(rgb), channel_g(rgb), channel_b(rgb))){
-            return -1;
-          }
-          if(x >= maxx){
-            x = 0;
-            ++y;
-          }
-          if(y >= maxy){
-            break;
-          }
-          wchar_t wcs;
-          mbstate_t mbstate;
-          memset(&mbstate, 0, sizeof(mbstate));
-          int eaten = mbrtowc(&wcs, &(*s)[idx], MB_CUR_MAX + 1, &mbstate);
-          if(eaten < 0){
-            return -1;
-          }
-          if(iswspace(wcs)){
-            idx += eaten;
-            continue;
-          }
-          int ulen = 0;
-          int r;
-          if(wcwidth(wcs) <= maxx - x){
-            if((r = ncplane_putegc(n, &(*s)[idx], &ulen)) <= 0){
-              if(ulen < 0){
-                return -1;
-              }
-            }
-          }else{
-            if((r = ncplane_putsimple(n, '#')) < 1){
-              return -1;
-            }
-          }
-          ncplane_cursor_yx(n, &y, &x);
-          idx += ulen;
-          bytes_out += ulen;
-          cols_out += r;
-          ++egcs_out;
+        s = strs + rand() % ((sizeof(strs) / sizeof(*strs)) - 1);
+        if(dostring(n, s, rgb, maxy, maxx, &egcs_out, &cols_out, &bytes_out)){
+          return -1;
         }
         rgb += step;
-      }while(y < maxy);
+        ncplane_cursor_yx(n, &y, &x);
+      }while(y < (maxy - 1) || x < (maxx - 2));
       struct ncplane* math = mathplane(nc);
       if(math == NULL){
         return -1;
       }
-      struct ncplane* mess = ncplane_new(nc, 7, 57, 2, 4, NULL);
+      struct ncplane_options nopts = {
+        .y = 2,
+        .x = 4,
+        .rows = 7,
+        .cols = 57,
+      };
+      struct ncplane* mess = ncplane_create(n, &nopts);
       if(mess == NULL){
         ncplane_destroy(math);
         return -1;
       }
       if(message(mess, maxy, maxx, i, sizeof(steps) / sizeof(*steps),
-                  bytes_out, egcs_out, cols_out)){
+                 bytes_out, egcs_out, cols_out)){
         ncplane_destroy(math); ncplane_destroy(mess);
         return -1;
       }
@@ -546,8 +564,8 @@ int witherworm_demo(struct notcurses* nc){
         uint64_t delay = timespec_to_ns(&demodelay);
         delay /= screens;
         struct timespec tv;
-        if(delay > GIG){
-          ns_to_timespec(GIG, &tv);
+        if(delay > NANOSECS_IN_SEC){
+          ns_to_timespec(NANOSECS_IN_SEC, &tv);
         }else{
           ns_to_timespec(delay, &tv);
         }
@@ -563,12 +581,15 @@ int witherworm_demo(struct notcurses* nc){
         if( (err = worm_move(nc, &wctx, maxy, maxx)) ){
           break;
         }
-        key = demo_getc_nblock(nc, NULL);
+        struct timespec ts;
+        ns_to_timespec(timespec_to_ns(&demodelay) / 10000, &ts);
+        key = demo_getc(nc, &ts, NULL);
         clock_gettime(CLOCK_MONOTONIC, &cur);
         if(timespec_to_ns(&screenend) < timespec_to_ns(&cur)){
           break;
         }
-      }while(key == 0);
+      }while(key != NCKEY_RESIZE);
+      free(wctx.worms);
 
       ncplane_destroy(mess);
       ncplane_destroy(math);
@@ -579,10 +600,7 @@ int witherworm_demo(struct notcurses* nc){
         DEMO_RENDER(nc);
       }
     }while(key == NCKEY_RESIZE);
-    if(key == 'q'){
-      return 1;
-    }
   }
-  ncplane_set_scrolling(n, false);
+  ncplane_set_scrolling(n, initial_scroll);
   return 0;
 }

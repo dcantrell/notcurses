@@ -1,30 +1,26 @@
+#define NCPP_EXCEPTIONS_PLEASE
 #include <mutex>
+#include <array>
 #include <atomic>
 #include <thread>
 #include <chrono>
 #include <vector>
 #include <cstdlib>
 #include <clocale>
+#include <unistd.h>
+#include <cinttypes>
 #include <ncpp/NotCurses.hh>
+#include <ncpp/Visual.hh>
+#include "compat/compat.h"
+#include "builddef.h"
 #include "version.h"
 
 std::mutex ncmtx;
-const std::string BackgroundFile = NOTCURSES_SHARE "/tetris-background.jpg";
+
+const std::string BackgroundFile = notcurses_data_path(nullptr, "tetris-background.jpg");
+const std::string LogoFile = notcurses_data_path(nullptr, "notcurses.png");
 
 using namespace std::chrono_literals;
-
-class TetrisNotcursesErr : public std::runtime_error {
-public:
-  TetrisNotcursesErr(const std::string& s) throw()
-    : std::runtime_error(s) {
-  }
-  TetrisNotcursesErr(char const* const message) throw()
-    : std::runtime_error(message) {
-  }
-  virtual char const* what() const throw() {
-    return exception::what();
-  }
-};
 
 class Tetris {
 public:
@@ -37,7 +33,7 @@ public:
     stdplane_(nc_.get_stdplane()),
     scoreplane_(nullptr),
     gameover_(gameover),
-    level_(0),
+    level_(1),
     linescleared_(0),
     msdelay_(Gravity(level_))
   {
@@ -65,6 +61,7 @@ private:
   std::mutex mtx_; // guards msdelay_
   std::unique_ptr<ncpp::Plane> curpiece_;
   std::unique_ptr<ncpp::Plane> board_;
+  std::unique_ptr<ncpp::Plane> logop_;
   std::unique_ptr<ncpp::Visual> backg_;
   ncpp::Plane* stdplane_;
   std::unique_ptr<ncpp::Plane> scoreplane_;
@@ -75,7 +72,7 @@ private:
   std::chrono::milliseconds msdelay_;
 
   // Returns true if there's a current piece which can be moved
-  bool PrepForMove(int* y, int* x) {
+  auto PrepForMove(int* y, int* x) -> bool {
     if(!curpiece_){
       return false;
     }

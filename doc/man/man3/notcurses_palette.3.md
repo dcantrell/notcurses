@@ -1,6 +1,6 @@
 % notcurses_palette(3)
 % nick black <nickblack@linux.com>
-% v1.3.3
+% v3.0.16
 
 # NAME
 
@@ -11,25 +11,29 @@ notcurses_palette - operations on notcurses palettes
 **#include <notcurses/notcurses.h>**
 
 ```c
-typedef struct palette256 {
+typedef struct ncpalette {
   // We store the RGB values as a regular ol' channel
-  uint32_t chans[256];
-} palette256;
+  uint32_t chans[NCPALETTESIZE];
+} ncpalette;
 ```
 
-**palette256* palette256_new(struct notcurses* nc);**
+**bool notcurses_cantruecolor(const struct notcurses* ***nc***);**
 
-**int palette256_use(struct notcurses* nc, const palette256* p);**
+**ncpalette* ncpalette_new(struct notcurses* ***nc***);**
 
-**int palette256_set_rgb(palette256* p, int idx, int r, int g, int b);**
+**int ncpalette_use(struct notcurses* ***nc***, const ncpalette* ***p***);**
 
-**int palette256_set(palette256* p, int idx, unsigned rgb);**
+**int ncpalette_set_rgb8(ncpalette* ***p***, int ***idx***, int ***r***, int ***g***, int ***b***);**
 
-**int palette256_get_rgb(const palette256* p, int idx, int* restrict r, int* restrict g, int* restrict b);**
+**int ncpalette_set(ncpalette* ***p***, int ***idx***, unsigned ***rgb***);**
 
-**void palette256_free(palette256* p);**
+**int ncpalette_get(const ncpalette* ***p***, int ***idx***, uint32_t* ***palent***);**
 
-**bool notcurses_canchangecolors(const struct notcurses* nc);**
+**int ncpalette_get_rgb8(const ncpalette* ***p***, int ***idx***, int* restrict ***r***, int* restrict ***g***, int* restrict ***b***);**
+
+**void ncpalette_free(ncpalette* ***p***);**
+
+**bool notcurses_canchangecolors(const struct notcurses* ***nc***);**
 
 # DESCRIPTION
 
@@ -43,12 +47,15 @@ since a single command can affect many cells on the screen.
 
 # RETURN VALUES
 
-Functions returning `int` return -1 on failure, or 0 on success. Failure is
-always due to invalid inputs. Functions returning `bool` are predicates, and
-return the requested value. Functions returning `unsigned` forms return the
+Functions returning **int** return -1 on failure, or 0 on success. Failure is
+always due to invalid inputs. Functions returning **bool** are predicates, and
+return the requested value. Functions returning **unsigned** forms return the
 input, modified as requested.
 
 # SEE ALSO
 
-**notcurses(3)**, **notcurses_cell(3)**, **notcurses_channels(3)**,
-**notcurses_ncplane(3)**, **notcurses_output(3)**
+**notcurses(3)**,
+**notcurses_cell(3)**,
+**notcurses_channels(3)**,
+**notcurses_output(3)**,
+**notcurses_plane(3)**

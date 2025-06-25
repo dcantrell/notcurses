@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 
+#ifndef DFSG_BUILD
+
 // unpacked data from original LBM file
 const unsigned char palette[] = 
         "\x00\x00\x00\xaf\xb7\xdf\xab\xb3\xdb\xa3" 
@@ -26490,32 +26492,32 @@ const size_t ORIGWIDTH = 640;
 // unsigned char, which must be exactly 769 bytes (256 entries * 24bpp + 1).
 // this last byte ought indeed be a zero (for checking), but zeros may occur
 // earlier (unlike a proper c string).
-static palette256*
+static ncpalette*
 load_palette(struct notcurses* nc, const unsigned char* pal, size_t size){
   if(size != NCPALETTESIZE * 3 + 1){
     return NULL;
   }
-  palette256* p256 = palette256_new(nc);
+  ncpalette* p256 = ncpalette_new(nc);
   for(int idx = 0 ; idx < NCPALETTESIZE ; ++idx){
-    if(palette256_set_rgb(p256, idx, pal[idx * 3], pal[idx * 3 + 1], pal[idx * 3 + 2])){
-      palette256_free(p256);
+    if(ncpalette_set_rgb8(p256, idx, pal[idx * 3], pal[idx * 3 + 1], pal[idx * 3 + 2])){
+      ncpalette_free(p256);
       return NULL;
     }
   }
   if(pal[NCPALETTESIZE * 3] != '\0'){
-    palette256_free(p256);
+    ncpalette_free(p256);
     return NULL;
   }
-  if(palette256_use(nc, p256)){
-    palette256_free(p256);
+  if(ncpalette_use(nc, p256)){
+    ncpalette_free(p256);
     return NULL;
   }
   return p256;
 }
 
 static int
-cycle_palettes(struct notcurses* nc, palette256* p){
-  // these ranges are cycling amongst themselves
+cycle_palettes(struct notcurses* nc, ncpalette* p){
+  // these ranges [lower, upper] are cycling amongst themselves
   static const struct {
     int l, u;
   } sets[] = {
@@ -26536,16 +26538,17 @@ cycle_palettes(struct notcurses* nc, palette256* p){
   }, *s;
   for(s = sets ; s->l ; ++s){
     unsigned tr, tg, tb;
-    // we're cycling left, so first grab the first rgbs
-    if(palette256_get_rgb(p, s->l, &tr, &tg, &tb) < 0){
+    // first grab the top rgbs (u), for use in bottom (l)
+    if(ncpalette_get_rgb8(p, s->u, &tr, &tg, &tb) < 0){
       return -1;
     }
-    for(int i = s->u ; i >= s->l ; --i){
+    // shift each range up one
+    for(int i = s->l ; i <= s->u ; ++i){
       unsigned r, g, b;
-      if(palette256_get_rgb(p, i, &r, &g, &b) < 0){
+      if(ncpalette_get_rgb8(p, i, &r, &g, &b) < 0){
         return -1;
       }
-      if(palette256_set_rgb(p, i, tr, tg, tb)){
+      if(ncpalette_set_rgb8(p, i, tr, tg, tb)){
         return -1;
       }
       tr = r;
@@ -26553,41 +26556,24 @@ cycle_palettes(struct notcurses* nc, palette256* p){
       tb = b;
     }
   }
-  if(palette256_use(nc, p)){
+  if(ncpalette_use(nc, p)){
     return -1;
   }
   return 0;
 }
 
-static struct ncplane*
-show_copyright(struct notcurses* nc){
-  int dimx, dimy;
-  notcurses_term_dim_yx(nc, &dimy, &dimx);
-  struct ncplane* n = ncplane_aligned(notcurses_stdplane(nc), 1, dimx,
-                                      dimy - 1, NCALIGN_RIGHT, NULL);
-  if(n){
-    if(ncplane_set_fg(n, 0xffffff) < 0){
-      return NULL;
-    }
-    if(ncplane_set_bg(n, 0x002000) < 0){
-      return NULL;
-    }
-    if(ncplane_putstr_aligned(n, 0, NCALIGN_CENTER, "Image copyright Mark Ferrari/Living Worlds. Used with permission.") < 0){
-      return NULL;
-    }
-  }
-  return n;
-}
-
-int jungle_demo(struct notcurses* nc){
+int jungle_demo(struct notcurses* nc, uint64_t startns){
   if(!notcurses_canchangecolor(nc)){
     return 0; // skip
   }
-  struct timespec start, now;
-  clock_gettime(CLOCK_MONOTONIC_RAW, &start);
+  // FIXME once we rewrite the garbage below using a modern ncvisual, we
+  // can rely on blitter degradation, and run this in ASCII mode.
+  if(!notcurses_canutf8(nc)){
+    return 0;
+  }
+  struct timespec now;
   size_t have = 0, out = 0;
-  struct ncplane* copyplane;
-  palette256* pal;
+  ncpalette* pal;
   if((pal = load_palette(nc, palette, sizeof(palette))) == NULL){
     return -1;
   }
@@ -26614,59 +26600,63 @@ int jungle_demo(struct notcurses* nc){
   if(out < ORIGWIDTH * ORIGHEIGHT){ // uh-oh
     return -1;
   }
-  int dimx, dimy;
+  unsigned dimx, dimy;
   struct ncplane* n = notcurses_stddim_yx(nc, &dimy, &dimx);
+  // FIXME rewrite all of this using modern ncvisual, sheesh
   dimy *= 2; // use half blocks
+  const int yoff = 2;
   const int xiter = ORIGWIDTH / dimx + !!(ORIGWIDTH % dimx);
-  const int yiter = ORIGHEIGHT / dimy + !!(ORIGHEIGHT % dimy);
+  const int yiter = ORIGHEIGHT / (dimy - yoff) + !!(ORIGHEIGHT % dimy);
   const int xoff = (dimx - ORIGWIDTH / xiter) / 2;
-  const int yoff = (dimy - ORIGHEIGHT / yiter) / 4;
   ncplane_erase(n);
-  if((copyplane = show_copyright(nc)) == NULL){
-    palette256_free(pal);
-    free(buf);
-    return -1;
-  }
-  cell c = CELL_TRIVIAL_INITIALIZER;
-  cell_load(n, &c, "\xe2\x96\x80"); // upper half block
+  nccell c = NCCELL_TRIVIAL_INITIALIZER;
+  nccell_load(n, &c, u8"\u2580"); // upper half block
   for(size_t y = 0 ; y < ORIGHEIGHT ; y += (yiter * 2)){
-    if(ncplane_cursor_move_yx(n, yoff + y / (yiter * 2), xoff)){
-      return -1;
-    }
-    // starting at 1 happens to give much better rain coverage on 80 columns
-    for(size_t x = 1 ; x < ORIGWIDTH ; x += xiter){
-      int idx = y * ORIGWIDTH + x;
-      int idx2 = (y + yiter) * ORIGWIDTH + x;
-      if(cell_set_fg_palindex(&c, buf[idx])){
+    unsigned targy = yoff + y / (yiter * 2);
+    if(targy < dimy / 2){
+      if(ncplane_cursor_move_yx(n, targy, xoff)){
         return -1;
       }
-      if(cell_set_bg_palindex(&c, buf[idx2])){
-        return -1;
-      }
-      if(ncplane_putc(n, &c) < 0){
-        return -1;
+      // starting at 1 happens to give much better rain coverage on 80 columns
+      for(size_t x = 1 ; x < ORIGWIDTH ; x += xiter){
+        int idx = y * ORIGWIDTH + x;
+        int idx2 = (y + yiter) * ORIGWIDTH + x;
+        if(nccell_set_fg_palindex(&c, buf[idx])){
+          return -1;
+        }
+        if(y + yiter < ORIGHEIGHT){
+          if(nccell_set_bg_palindex(&c, buf[idx2])){
+            return -1;
+          }
+        }else{
+          if(nccell_set_bg_palindex(&c, 0)){
+            return -1;
+          }
+        }
+        if(ncplane_putc(n, &c) < 0){
+          return -1;
+        }
       }
     }
   }
-  cell_release(n, &c);
+  nccell_release(n, &c);
   free(buf);
   int iter = 0;
-  // don't try to run faster than, eh, 140Hz
-  int64_t iterns = GIG / 100;
-  int64_t nsrunning;
+  int64_t iterns = NANOSECS_IN_SEC / 30;
+  int64_t nsrunning = 0;
   do{
     DEMO_RENDER(nc);
     ++iter;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &now);
-    nsrunning = timespec_to_ns(&now) - timespec_to_ns(&start);
     if(nsrunning < iter * iterns){
       struct timespec sleepts;
       ns_to_timespec(iter * iterns - nsrunning, &sleepts);
       demo_nanosleep(nc, &sleepts);
     }
     cycle_palettes(nc, pal);
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    nsrunning = timespec_to_ns(&now) - startns;
   }while(nsrunning > 0 && (uint64_t)nsrunning < 5 * timespec_to_ns(&demodelay));
-  palette256_free(pal);
-  ncplane_destroy(copyplane);
+  ncpalette_free(pal);
   return 0;
 }
+#endif

@@ -5,10 +5,11 @@
 #include <assert.h>
 #include <string.h>
 #include <pthread.h>
-#include <sys/poll.h>
 #include "demo.h"
 
 #define INITIAL_TABLET_COUNT 4
+
+static pthread_mutex_t renderlock = PTHREAD_MUTEX_INITIALIZER;
 
 // FIXME ought just be an unordered_map
 typedef struct tabletctx {
@@ -58,102 +59,56 @@ kill_active_tablet(struct ncreel* pr, tabletctx** tctx){
   return 0;
 }
 
-// We need write in reverse order (since only the bottom will be seen, if we're
-// partially off-screen), but also leave unused space at the end (since
-// wresize() only keeps the top and left on a shrink).
 static int
-tabletup(struct ncplane* w, int begx, int begy, int maxx, int maxy,
-         tabletctx* tctx, int rgb){
+tabletdraw(struct ncplane* w, int maxy, tabletctx* tctx, unsigned rgb){
   char cchbuf[2];
-  cell c = CELL_TRIVIAL_INITIALIZER;
-  int y, idx;
-  idx = tctx->lines;
-  if(maxy - begy > tctx->lines){
-    maxy -= (maxy - begy - tctx->lines);
-  }
-/*fprintf(stderr, "-OFFSET BY %d (%d->%d)\n", maxy - begy - tctx->lines,
-        maxy, maxy - (maxy - begy - tctx->lines));*/
-  for(y = maxy ; y >= begy ; --y, rgb += 16){
-    snprintf(cchbuf, sizeof(cchbuf) / sizeof(*cchbuf), "%x", idx % 16);
-    cell_load(w, &c, cchbuf);
-    if(cell_set_fg_rgb(&c, (rgb >> 16u) % 0xffu, (rgb >> 8u) % 0xffu, rgb % 0xffu)){
-      return -1;
-    }
-    int x;
-    for(x = begx ; x <= maxx ; ++x){
-      if(ncplane_putc_yx(w, y, x, &c) <= 0){
-        return -1;
-      }
-    }
-    cell_release(w, &c);
-    if(--idx == 0){
-      break;
-    }
-  }
-// fprintf(stderr, "tabletup done%s at %d (%d->%d)\n", idx == 0 ? " early" : "", y, begy, maxy);
-  return tctx->lines - idx;
-}
-
-static int
-tabletdown(struct ncplane* w, int begx, int begy, int maxx, int maxy,
-           tabletctx* tctx, unsigned rgb){
-  char cchbuf[2];
-  cell c = CELL_TRIVIAL_INITIALIZER;
+  nccell c = NCCELL_TRIVIAL_INITIALIZER;
   int y;
-  for(y = begy ; y <= maxy ; ++y, rgb += 16){
-    if(y - begy >= tctx->lines){
-      break;
-    }
+  int maxx = ncplane_dim_x(w) - 1;
+  if(maxy > tctx->lines){
+    maxy = tctx->lines;
+  }
+  for(y = 0 ; y < maxy ; ++y, rgb += 16){
     snprintf(cchbuf, sizeof(cchbuf) / sizeof(*cchbuf), "%x", y % 16);
-    cell_load(w, &c, cchbuf);
-    if(cell_set_fg_rgb(&c, (rgb >> 16u) % 0xffu, (rgb >> 8u) % 0xffu, rgb % 0xffu)){
+    nccell_load(w, &c, cchbuf);
+    if(nccell_set_fg_rgb8(&c, (rgb >> 16u) % 0xffu, (rgb >> 8u) % 0xffu, rgb % 0xffu)){
       return -1;
     }
     int x;
-    for(x = begx ; x <= maxx ; ++x){
+    for(x = 0 ; x <= maxx ; ++x){
       if(ncplane_putc_yx(w, y, x, &c) <= 0){
         return -1;
       }
     }
-    cell_release(w, &c);
+    nccell_release(w, &c);
   }
-  return y - begy;
+  return y;
 }
 
 static int
-tabletdraw(struct nctablet* t, int begx, int begy, int maxx, int maxy, bool cliptop){
-  struct ncplane* p = nctablet_ncplane(t);
+drawcb(struct nctablet* t, bool drawfromtop){
+  struct ncplane* p = nctablet_plane(t);
   tabletctx* tctx = nctablet_userptr(t);
+  if(tctx == NULL){
+    return -1;
+  }
   pthread_mutex_lock(&tctx->lock);
   unsigned rgb = tctx->rgb;
   int ll;
-  if(cliptop){
-    ll = tabletup(p, begx, begy, maxx, maxy, tctx, rgb);
-  }else{
-    ll = tabletdown(p, begx, begy, maxx, maxy, tctx, rgb);
-  }
-  ncplane_set_fg_rgb(p, 242, 242, 242);
+  int maxy = ncplane_dim_y(p);
+  ll = tabletdraw(p, maxy, tctx, rgb);
+  ncplane_set_fg_rgb8(p, 242, 242, 242);
   if(ll){
-    int summaryy = begy;
-    if(cliptop){
-      if(ll == maxy - begy + 1){
-        summaryy = ll - 1;
-      }else{
-        summaryy = ll;
-      }
-    }
-    ncplane_styles_on(p, NCSTYLE_BOLD);
-    if(ncplane_printf_yx(p, summaryy, begx, "[#%u %d line%s %u/%u] ",
-                         tctx->id, tctx->lines, tctx->lines == 1 ? "" : "s",
-                         begy, maxy) < 0){
+    const int summaryy = drawfromtop ? 0 : ll - 1;
+    ncplane_on_styles(p, NCSTYLE_BOLD);
+    if(ncplane_printf_yx(p, summaryy, 0, "[#%u %d lines] ",
+                         tctx->id, tctx->lines) < 0){
       pthread_mutex_unlock(&tctx->lock);
       return -1;
     }
-    ncplane_styles_off(p, NCSTYLE_BOLD);
+    ncplane_off_styles(p, NCSTYLE_BOLD);
   }
-/*fprintf(stderr, "  \\--> callback for %d, %d lines (%d/%d -> %d/%d) dir: %s wrote: %d ret: %d\n", tctx->id,
-    tctx->lines, begy, begx, maxy, maxx,
-    cliptop ? "up" : "down", ll, err);*/
+//fprintf(stderr, "  \\--> callback for %d, %d lines (%d/%d -> %d/%d) dir: %s wrote: %d\n", tctx->id, tctx->lines, begy, begx, maxy, maxx, cliptop ? "up" : "down", ll);
   pthread_mutex_unlock(&tctx->lock);
   return ll;
 }
@@ -166,23 +121,29 @@ tablet_thread(void* vtabletctx){
   tabletctx* tctx = vtabletctx;
   while(true){
     struct timespec ts;
-    ts.tv_sec = random() % 2 + MINSECONDS;
-    ts.tv_nsec = random() % 1000000000;
+    ts.tv_sec = rand() % 2 + MINSECONDS;
+    ts.tv_nsec = rand() % 1000000000;
     nanosleep(&ts, NULL);
-    int action = random() % 5;
+    int action = rand() % 5;
     pthread_mutex_lock(&tctx->lock);
     if(action < 2){
-      if((tctx->lines -= (action + 1)) < 1){
-        tctx->lines = 1;
-      }
-      ncreel_touch(tctx->pr, tctx->t);
+      tctx->lines -= (action + 1);
     }else if(action > 2){
-      if((tctx->lines += (action - 2)) < 1){
-        tctx->lines = 1;
-      }
-      ncreel_touch(tctx->pr, tctx->t);
+      tctx->lines += (action - 2);
+    }
+    if(tctx->lines < 2){
+      tctx->lines = 2;
     }
     pthread_mutex_unlock(&tctx->lock);
+    pthread_mutex_lock(&renderlock);
+    if(nctablet_plane(tctx->t)){
+      ncreel_redraw(tctx->pr);
+      struct ncplane* tplane = nctablet_plane(tctx->t);
+      if(tplane){
+        demo_render(ncplane_notcurses(tplane));
+      }
+    }
+    pthread_mutex_unlock(&renderlock);
   }
   return tctx;
 }
@@ -195,10 +156,10 @@ new_tabletctx(struct ncreel* pr, unsigned *id){
   }
   pthread_mutex_init(&tctx->lock, NULL);
   tctx->pr = pr;
-  tctx->lines = random() % 10 + 1; // FIXME a nice gaussian would be swell
-  tctx->rgb = random() % (1u << 24u);
+  tctx->lines = rand() % 10 + 2; // FIXME a nice gaussian would be swell
+  tctx->rgb = rand() % (1u << 24u);
   tctx->id = ++*id;
-  if((tctx->t = ncreel_add(pr, NULL, NULL, tabletdraw, tctx)) == NULL){
+  if((tctx->t = ncreel_add(pr, NULL, NULL, drawcb, tctx)) == NULL){
     pthread_mutex_destroy(&tctx->lock);
     free(tctx);
     return NULL;
@@ -211,161 +172,151 @@ new_tabletctx(struct ncreel* pr, unsigned *id){
   return tctx;
 }
 
-static wchar_t
-handle_input(struct notcurses* nc, struct ncreel* pr, int efd,
-             const struct timespec* deadline){
-  struct pollfd fds[2] = {
-    { .fd = demo_input_fd(), .events = POLLIN, .revents = 0, },
-    { .fd = efd,             .events = POLLIN, .revents = 0, },
-  };
-  sigset_t sset;
-  sigemptyset(&sset);
-  wchar_t key = -1;
-  int pret;
-  DEMO_RENDER(nc);
+static uint32_t
+handle_input(struct notcurses* nc, const struct timespec* deadline,
+             ncinput* ni){
   int64_t deadlinens = timespec_to_ns(deadline);
-  do{
-    struct timespec pollspec, cur;
-    clock_gettime(CLOCK_MONOTONIC, &cur);
-    int64_t curns = timespec_to_ns(&cur);
-    if(curns > deadlinens){
-      return 0;
-    }
-    ns_to_timespec(curns - deadlinens, &pollspec);
-    pret = ppoll(fds, sizeof(fds) / sizeof(*fds), &pollspec, &sset);
-    if(pret == 0){
-      return 0;
-    }else if(pret < 0){
-      if(errno != EINTR){
-        fprintf(stderr, "Error polling on stdin/eventfd (%s)\n", strerror(errno));
-        return (wchar_t)-1;
-      }
-    }else{
-      if(fds[0].revents & POLLIN){
-        uint64_t eventcount;
-        if(read(fds[0].fd, &eventcount, sizeof(eventcount)) > 0){
-          key = demo_getc_nblock(nc, NULL);
-          if(key < 0){
-            return -1;
-          }
-        }
-      }
-      if(fds[1].revents & POLLIN){
-        uint64_t val;
-        if(read(efd, &val, sizeof(val)) != sizeof(val)){
-          fprintf(stderr, "Error reading from eventfd %d (%s)\n", efd, strerror(errno));
-        }else if(key < 0){
-          ncreel_redraw(pr);
-          DEMO_RENDER(nc);
-        }
-      }
-    }
-  }while(key < 0);
-  return key;
-}
-
-static int
-close_pipes(int* pipes){
-  if(close(pipes[0]) | close(pipes[1])){ // intentional, avoid short-circuiting
-    return -1;
+  struct timespec pollspec, cur;
+  clock_gettime(CLOCK_MONOTONIC, &cur);
+  int64_t curns = timespec_to_ns(&cur);
+  if(curns > deadlinens){
+    return 0;
   }
-  return 0;
+  ns_to_timespec(deadlinens - curns, &pollspec);
+  uint32_t r = demo_getc(nc, &pollspec, ni);
+  return r;
 }
 
 static int
-ncreel_demo_core(struct notcurses* nc, int efdr, int efdw){
+ncreel_demo_core(struct notcurses* nc, uint64_t startns){
   tabletctx* tctxs = NULL;
   bool aborted = false;
   int x = 8, y = 4;
+  unsigned dimy, dimx;
+  struct ncplane* std = notcurses_stddim_yx(nc, &dimy, &dimx);
+  struct ncplane_options nopts = {
+    .y = y,
+    .x = x,
+    .rows = dimy - 12,
+    .cols = dimx - 16,
+  };
+  struct ncplane* n = ncplane_create(std, &nopts);
+  if(n == NULL){
+    return -1;
+  }
   ncreel_options popts = {
-    .infinitescroll = true,
-    .circular = true,
-    .min_supported_cols = 8,
-    .min_supported_rows = 5,
     .bordermask = 0,
     .borderchan = 0,
     .tabletchan = 0,
     .focusedchan = 0,
-    .toff = y,
-    .loff = x,
-    .roff = x,
-    .boff = y,
-    .bgchannel = 0,
+    .flags = NCREEL_OPTION_INFINITESCROLL | NCREEL_OPTION_CIRCULAR,
   };
-  channels_set_fg_rgb(&popts.focusedchan, 58, 150, 221);
-  channels_set_bg_rgb(&popts.focusedchan, 97, 214, 214);
-  channels_set_fg_rgb(&popts.tabletchan, 19, 161, 14);
-  channels_set_bg_rgb(&popts.borderchan, 0, 0, 0);
-  channels_set_fg_rgb(&popts.borderchan, 136, 23, 152);
-  channels_set_bg_rgb(&popts.borderchan, 0, 0, 0);
-  if(channels_set_fg_alpha(&popts.bgchannel, CELL_ALPHA_TRANSPARENT)){
+  ncchannels_set_fg_rgb8(&popts.focusedchan, 58, 150, 221);
+  ncchannels_set_bg_rgb8(&popts.focusedchan, 97, 214, 214);
+  ncchannels_set_fg_rgb8(&popts.tabletchan, 19, 161, 14);
+  ncchannels_set_bg_rgb8(&popts.borderchan, 0, 0, 0);
+  ncchannels_set_fg_rgb8(&popts.borderchan, 136, 23, 152);
+  ncchannels_set_bg_rgb8(&popts.borderchan, 0, 0, 0);
+  uint64_t bgchannels = 0;
+  if(ncchannels_set_fg_alpha(&bgchannels, NCALPHA_TRANSPARENT)){
+    ncplane_destroy(n);
     return -1;
   }
-  if(channels_set_bg_alpha(&popts.bgchannel, CELL_ALPHA_TRANSPARENT)){
+  if(ncchannels_set_bg_alpha(&bgchannels, NCALPHA_TRANSPARENT)){
+    ncplane_destroy(n);
     return -1;
   }
-  int dimy;
-  struct ncplane* w = notcurses_stddim_yx(nc, &dimy, NULL);
-  struct ncreel* pr = ncreel_create(w, &popts, efdw);
-  if(pr == NULL){
-    fprintf(stderr, "Error creating ncreel\n");
+  ncplane_set_base(n, "", 0, bgchannels);
+  struct ncreel* nr = ncreel_create(n, &popts);
+  if(nr == NULL){
+    ncplane_destroy(n);
     return -1;
   }
   // Press a for a new nc above the current, c for a new one below the
   // current, and b for a new block at arbitrary placement.
-  ncplane_styles_on(w, NCSTYLE_BOLD | NCSTYLE_ITALIC);
-  ncplane_set_fg_rgb(w, 58, 150, 221);
-  ncplane_set_bg_default(w);
-  ncplane_printf_yx(w, dimy - 1, 1, "a, b, c create tablets, DEL deletes.");
-  ncplane_styles_off(w, NCSTYLE_BOLD | NCSTYLE_ITALIC);
-  // FIXME clrtoeol();
+  struct ncplane_options legendops = {
+    .rows = 4,
+    .cols = dimx - 2,
+    .x = 0,
+    .y = 0,
+  };
+  struct ncplane* lplane = ncplane_create(std, &legendops);
+  if(lplane == NULL){
+    ncreel_destroy(nr);
+    return -1;
+  }
+  ncplane_on_styles(lplane, NCSTYLE_BOLD | NCSTYLE_ITALIC);
+  ncplane_set_fg_rgb8(lplane, 58, 150, 221);
+  uint64_t channels = 0;
+  ncchannels_set_fg_alpha(&channels, NCALPHA_TRANSPARENT);
+  ncchannels_set_bg_alpha(&channels, NCALPHA_TRANSPARENT);
+  ncplane_set_base(lplane, "", 0, channels);
+  ncplane_set_bg_default(lplane);
+  ncplane_printf_yx(lplane, 1, 2, "a, b, c create tablets, DEL deletes.");
+  ncplane_off_styles(lplane, NCSTYLE_BOLD | NCSTYLE_ITALIC);
   struct timespec deadline;
-  clock_gettime(CLOCK_MONOTONIC, &deadline);
-  ns_to_timespec((timespec_to_ns(&demodelay) * 5) + timespec_to_ns(&deadline),
-                 &deadline);
+  ns_to_timespec((timespec_to_ns(&demodelay) * 5) + startns, &deadline);
   unsigned id = 0;
   struct tabletctx* newtablet;
   // Make an initial number of tablets suitable for the screen's height
   while(id < dimy / 8u){
-    newtablet = new_tabletctx(pr, &id);
+    newtablet = new_tabletctx(nr, &id);
     if(newtablet == NULL){
-      ncreel_destroy(pr);
+      ncreel_destroy(nr);
+      ncplane_destroy(lplane);
       return -1;
     }
     newtablet->next = tctxs;
     tctxs = newtablet;
   }
   do{
-    ncplane_styles_set(w, 0);
-    ncplane_set_fg_rgb(w, 197, 15, 31);
-    int count = ncreel_tabletcount(pr);
-    ncplane_styles_on(w, NCSTYLE_BOLD);
-    ncplane_printf_yx(w, dimy - 2, 2, "%d tablet%s", count, count == 1 ? "" : "s");
-    ncplane_styles_off(w, NCSTYLE_BOLD);
-    // FIXME wclrtoeol(w);
-    ncplane_set_fg_rgb(w, 0, 55, 218);
-    wchar_t rw;
-    if((rw = handle_input(nc, pr, efdr, &deadline)) < 0){
+    ncplane_set_styles(lplane, NCSTYLE_NONE);
+    ncplane_set_fg_rgb8(lplane, 197, 15, 31);
+    int count = ncreel_tabletcount(nr);
+    ncplane_on_styles(lplane, NCSTYLE_BOLD);
+    ncplane_printf_yx(lplane, 2, 2, "%d tablet%s", count, count == 1 ? "" : "s");
+    ncplane_off_styles(lplane, NCSTYLE_BOLD);
+    ncplane_set_fg_rgb8(lplane, 0, 55, 218);
+    uint32_t rw;
+    ncinput ni;
+    pthread_mutex_lock(&renderlock);
+    ncreel_redraw(nr);
+    int renderret;
+    renderret = demo_render(nc);
+    pthread_mutex_unlock(&renderlock);
+    if(renderret){
+      while(tctxs){
+        kill_tablet(&tctxs);
+      }
+      ncreel_destroy(nr);
+      ncplane_destroy(lplane);
+      return renderret;
+    }
+    if((rw = handle_input(nc, &deadline, &ni)) == (uint32_t)-1){
       break;
     }
     // FIXME clrtoeol();
     newtablet = NULL;
     switch(rw){
-      case 'a': newtablet = new_tabletctx(pr, &id); break;
-      case 'b': newtablet = new_tabletctx(pr, &id); break;
-      case 'c': newtablet = new_tabletctx(pr, &id); break;
-      case 'h': --x; if(ncreel_move(pr, x, y)){ ++x; } break;
-      case 'l': ++x; if(ncreel_move(pr, x, y)){ --x; } break;
-      case 'k': ncreel_prev(pr); break;
-      case 'j': ncreel_next(pr); break;
+      case 'a': newtablet = new_tabletctx(nr, &id); break;
+      case 'b': newtablet = new_tabletctx(nr, &id); break;
+      case 'c': newtablet = new_tabletctx(nr, &id); break;
+      case 'k': ncreel_prev(nr); break;
+      case 'j': ncreel_next(nr); break;
       case 'q': aborted = true; break;
-      case NCKEY_LEFT: --x; if(ncreel_move(pr, x, y)){ ++x; } break;
-      case NCKEY_RIGHT: ++x; if(ncreel_move(pr, x, y)){ --x; } break;
-      case NCKEY_UP: ncreel_prev(pr); break;
-      case NCKEY_DOWN: ncreel_next(pr); break;
-      case NCKEY_DEL: kill_active_tablet(pr, &tctxs); break;
+      case NCKEY_UP: ncreel_prev(nr); break;
+      case NCKEY_DOWN: ncreel_next(nr); break;
+      case NCKEY_LEFT:
+        ncplane_yx(ncreel_plane(nr), &y, &x);
+        ncplane_move_yx(ncreel_plane(nr), y, x - 1);
+        break;
+      case NCKEY_RIGHT:
+        ncplane_yx(ncreel_plane(nr), &y, &x);
+        ncplane_move_yx(ncreel_plane(nr), y, x + 1);
+        break;
+      case NCKEY_DEL: kill_active_tablet(nr, &tctxs); break;
       case NCKEY_RESIZE: notcurses_render(nc); break;
-      default: ncplane_printf_yx(w, 3, 2, "Unknown keycode (0x%x)\n", rw); break;
+      default: ncplane_printf_yx(lplane, 3, 2, "Unknown keycode (0x%lx)\n", (unsigned long)rw); break;
     }
     if(newtablet){
       newtablet->next = tctxs;
@@ -376,28 +327,18 @@ ncreel_demo_core(struct notcurses* nc, int efdr, int efdw){
     if(timespec_subtract_ns(&cur, &deadline) >= 0){
       break;
     }
-    dimy = ncplane_dim_y(w);
+    dimy = ncplane_dim_y(n);
   }while(!aborted);
   while(tctxs){
     kill_tablet(&tctxs);
   }
-  if(ncreel_destroy(pr)){
-    fprintf(stderr, "Error destroying ncreel\n");
-    return -1;
-  }
+  ncreel_destroy(nr);
+  ncplane_destroy(lplane);
   return aborted ? 1 : 0;
 }
 
-int reel_demo(struct notcurses* nc){
-  int pipes[2];
+int reel_demo(struct notcurses* nc, uint64_t startns){
   ncplane_greyscale(notcurses_stdplane(nc));
-  // freebsd doesn't have eventfd :/
-  if(pipe2(pipes, O_CLOEXEC | O_NONBLOCK)){
-    fprintf(stderr, "Error creating pipe (%s)\n", strerror(errno));
-    return -1;
-  }
-  int ret = ncreel_demo_core(nc, pipes[0], pipes[1]);
-  close_pipes(pipes);
-  DEMO_RENDER(nc);
+  int ret = ncreel_demo_core(nc, startns);
   return ret;
 }

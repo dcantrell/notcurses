@@ -5,35 +5,34 @@
 #include <notcurses/notcurses.h>
 
 #include "Tablet.hh"
-#include "Root.hh"
+#include "Plane.hh"
+#include "Utilities.hh"
+#include "Widget.hh"
 
 namespace ncpp
 {
-	class Plane;
-
-	class NCPP_API_EXPORT NcReel : public Root
+	class NCPP_API_EXPORT NcReel : public Widget
 	{
 	public:
 		static ncreel_options default_options;
 
-		explicit NcReel (Plane &plane, const ncreel_options *popts = nullptr, int efd = -1)
-			: NcReel (&plane, popts, efd)
-		{}
-
-		explicit NcReel (Plane *plane, const ncreel_options *popts = nullptr, int efd = -1)
+		explicit NcReel (Plane &plane, const ncreel_options *popts = nullptr)
+			: Widget (Utilities::get_notcurses_cpp (plane))
 		{
-			if (plane == nullptr)
-				throw invalid_argument ("'plane' must be a valid pointer");
-
-			create_reel (reinterpret_cast<ncplane*>(plane), popts, efd);
+			ensure_valid_plane (plane);
+			common_init (Utilities::to_ncplane (plane), popts);
+			take_plane_ownership (plane);
 		}
 
-		explicit NcReel (ncplane *plane, const ncreel_options *popts = nullptr, int efd = -1)
+		explicit NcReel (Plane *plane, const ncreel_options *popts = nullptr)
+			: Widget (Utilities::get_notcurses_cpp (plane))
 		{
 			if (plane == nullptr)
 				throw invalid_argument ("'plane' must be a valid pointer");
 
-			create_reel (plane, popts, efd);
+			ensure_valid_plane (plane);
+			common_init (Utilities::to_ncplane (plane), popts);
+			take_plane_ownership (plane);
 		}
 
 		~NcReel ()
@@ -57,9 +56,9 @@ namespace ncpp
 		{
 			nctablet *t = ncreel_add (reel, get_tablet (after), get_tablet (before), cb, opaque);
 			if (t == nullptr)
-				throw init_error ("notcurses failed to create a new tablet");
+				throw init_error ("Notcurses failed to create a new tablet");
 
-			return NcTablet::map_tablet (t);
+			return NcTablet::map_tablet (t, get_notcurses_cpp ());
 		}
 
 		NcTablet* add (NcTablet &after, NcTablet &before, tabletcb cb, void *opaque = nullptr) const noexcept
@@ -72,16 +71,6 @@ namespace ncpp
 			return ncreel_tabletcount (reel);
 		}
 
-		bool touch (NcTablet *t) const NOEXCEPT_MAYBE
-		{
-			return error_guard (ncreel_touch (reel, get_tablet (t)), -1);
-		}
-
-		bool touch (NcTablet &t) const NOEXCEPT_MAYBE
-		{
-			return touch (&t);
-		}
-
 		bool del (NcTablet *t) const NOEXCEPT_MAYBE
 		{
 			return error_guard (ncreel_del (reel, get_tablet (t)), -1);
@@ -90,16 +79,6 @@ namespace ncpp
 		bool del (NcTablet &t) const NOEXCEPT_MAYBE
 		{
 			return del (&t);
-		}
-
-		bool del_focused () const NOEXCEPT_MAYBE
-		{
-			return error_guard (ncreel_del_focused (reel), -1);
-		}
-
-		bool move (int x, int y) const NOEXCEPT_MAYBE
-		{
-			return error_guard (ncreel_move (reel, x, y), -1);
 		}
 
 		bool redraw () const NOEXCEPT_MAYBE
@@ -113,7 +92,7 @@ namespace ncpp
 			if (t == nullptr)
 				return nullptr;
 
-			return NcTablet::map_tablet (t);
+			return NcTablet::map_tablet (t, get_notcurses_cpp ());
 		}
 
 		NcTablet* next () const noexcept
@@ -122,7 +101,7 @@ namespace ncpp
 			if (t == nullptr)
 				return nullptr;
 
-			return NcTablet::map_tablet (t);
+			return NcTablet::map_tablet (t, get_notcurses_cpp ());
 		}
 
 		NcTablet* prev () const noexcept
@@ -131,7 +110,12 @@ namespace ncpp
 			if (t == nullptr)
 				return nullptr;
 
-			return NcTablet::map_tablet (t);
+			return NcTablet::map_tablet (t, get_notcurses_cpp ());
+		}
+
+		bool offer_input (const struct ncinput* nci) const NOEXCEPT_MAYBE
+		{
+			return error_guard<bool, bool> (ncreel_offer_input (reel, nci), false);
 		}
 
 		Plane* get_plane () const noexcept;
@@ -145,11 +129,11 @@ namespace ncpp
 			return t->get_tablet ();
 		}
 
-		void create_reel (ncplane *plane, const ncreel_options *popts, int efd)
+		void common_init (ncplane *plane, const ncreel_options *popts = nullptr)
 		{
-			reel = ncreel_create (plane, popts == nullptr ? &default_options : popts, efd);
+			reel = ncreel_create (plane, popts == nullptr ? &default_options : popts);
 			if (reel == nullptr)
-				throw init_error ("notcurses failed to create a new ncreel");
+				throw init_error ("Notcurses failed to create a new ncreel");
 		}
 
 	private:

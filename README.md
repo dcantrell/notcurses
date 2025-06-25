@@ -1,91 +1,93 @@
-# notcurses
-blingful TUI library for modern terminal emulators. definitely not curses.
+# Notcurses: blingful TUIs and character graphics
 
-* birthed screaming into this world by [nick black](https://nick-black.com/dankwiki/index.php/Hack_on) (<nickblack@linux.com>)
-* C++ wrappers by [marek habersack](http://twistedcode.net/blog/) (<grendel@twistedcode.net>)
+**What it is**: a library facilitating complex TUIs on modern terminal
+emulators, supporting vivid colors, multimedia, threads, and Unicode to the
+maximum degree possible. [Things](https://www.youtube.com/watch?v=dcjkezf1ARY) can be done with
+Notcurses that simply can't be done with NCURSES. It is furthermore
+fast as shit. **What it is not**: a source-compatible X/Open Curses implementation, nor a
+replacement for NCURSES on existing systems.
+
+<p align="center">
+<a href="https://www.youtube.com/watch?v=dcjkezf1ARY"><img src="https://raw.githubusercontent.com/dankamongmen/notcurses/gh-pages/notcurses-logo.png" alt="setting the standard (hype video)"/></a>
+</p>
 
 for more information, see [dankwiki](https://nick-black.com/dankwiki/index.php/Notcurses)
-and the [man pages](https://nick-black.com/notcurses). There's also a reference
-[in this repo](USAGE.md).
+and the [man pages](https://notcurses.com). in addition, there is
+[Doxygen](https://notcurses.com/html/) output.
+i wrote a coherent [guidebook](https://nick-black.com/htp-notcurses.pdf), which is available for
+free download (or [paperback purchase](https://amazon.com/dp/B086PNVNC9)).
 
-In addition, there is
-[Doxygen](https://nick-black.com/notcurses/html/) output. There is a [mailing
-list](https://groups.google.com/forum/#!forum/notcurses) which can be reached
-via notcurses@googlegroups.com.
+i've not yet added many documented examples, but [src/poc/](https://github.com/dankamongmen/notcurses/tree/master/src/poc)
+and [src/pocpp/](https://github.com/dankamongmen/notcurses/tree/master/src/pocpp)
+contain many small C and C++ programs respectively. `notcurses-demo` covers
+most of the functionality of Notcurses.
 
-I wrote a coherent [guidebook](https://nick-black.com/htp-notcurses.pdf), which
-is available for free download, or [paperback purchase](https://amazon.com/dp/B086PNVNC9).
+**If you're running Notcurses applications in a Docker, please consult
+"[Environment notes](#environment-notes)" below.**
 
-Notcurses is available in the Arch [AUR](https://aur.archlinux.org/packages/notcurses/).
-Packages for Debian Unstable and Ubuntu Focal are available from [DSSCAW](https://www.dsscaw.com/apt.html).
+<a href="https://repology.org/project/notcurses/versions">
+<img src="https://repology.org/badge/vertical-allrepos/notcurses.svg" alt="Packaging status" align="right">
+</a>
 
-[![Build Status](https://drone.dsscaw.com:4443/api/badges/dankamongmen/notcurses/status.svg)](https://drone.dsscaw.com:4443/dankamongmen/notcurses)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+![Linux](https://img.shields.io/badge/-Linux-grey?logo=linux)
+![FreeBSD](https://img.shields.io/badge/-FreeBSD-grey?logo=freebsd)
+![Windows](https://img.shields.io/badge/-Windows-grey?logo=windows)
+![macOS](https://img.shields.io/badge/-macOS-grey?logo=macos)
 
-* [Introduction](#introduction)
-* [Requirements](#requirements)
-  * [Building](#building)
-* [Included tools](#included-tools)
-* [Differences from NCURSES](#differences-from-ncurses)
-  * [Features missing relative to NCURSES](#features-missing-relative-to-ncurses)
-  * [Adapting NCURSES programs](#adapting-ncurses-programs)
-* [Environment notes](#environment-notes)
-  * [TrueColor detection](#TrueColor-detection)
-  * [Fonts](#fonts)
-  * [FAQs](#faqs)
-* [Supplemental material](#supplemental-material)
-  * [Useful links](#useful-links)
-  * [Other TUI libraries](#other-tui-libraries-of-note)
-  * [History](#history)
-  * [Thanks](#thanks)
+[![Linux](https://github.com/dankamongmen/notcurses/actions/workflows/ubuntu_test.yml/badge.svg?branch=master)](https://github.com/dankamongmen/notcurses/actions/workflows/ubuntu_test.yml?query=branch%3Amaster)
+[![macOS](https://github.com/dankamongmen/notcurses/actions/workflows/macos_test.yml/badge.svg?branch=master)](https://github.com/dankamongmen/notcurses/actions/workflows/macos_test.yml?query=branch%3Amaster)
+[![Windows](https://github.com/dankamongmen/notcurses/actions/workflows/windows_test.yml/badge.svg?branch=master)](https://github.com/dankamongmen/notcurses/actions/workflows/windows_test.yml?query=branch%3Amaster)
+
+[![pypi_version](https://img.shields.io/pypi/v/notcurses?label=pypi)](https://pypi.org/project/notcurses)
+[![crates.io](https://img.shields.io/crates/v/libnotcurses-sys.svg)](https://crates.io/crates/libnotcurses-sys)
+
+[![Matrix](https://img.shields.io/matrix/notcursesdev:matrix.org?label=matrixchat)](https://app.element.io/#/room/#notcursesdev:matrix.org)
+[![Sponsor](https://img.shields.io/badge/-Sponsor-red?logo=github)](https://github.com/sponsors/dankamongmen)
 
 ## Introduction
 
-* **What it is**: a library facilitating complex TUIs on modern terminal
-    emulators, supporting vivid colors and Unicode to the maximum degree
-    possible. Many tasks delegated to Curses can be achieved using Notcurses
-    (and vice versa).
-
-* **What it is not**: a source-compatible X/Open Curses implementation, nor a
-    replacement for NCURSES on existing systems.
-
 Notcurses abandons the X/Open Curses API bundled as part of the Single UNIX
-Specification. The latter shows its age, and seems not capable of making use of
-terminal functionality such as unindexed 24-bit color ("TrueColor", not to be
-confused with the 8-bit indexed 24-bit "extended color" of NCURSES).
-For some necessary background, consult Thomas E. Dickey's
+Specification. For some necessary background, consult Thomas E. Dickey's
 superb and authoritative [NCURSES FAQ](https://invisible-island.net/ncurses/ncurses.faq.html#xterm_16MegaColors).
-As such, Notcurses is not a drop-in Curses replacement. It is almost certainly
-less portable, and definitely tested on less hardware. Sorry about that.
-Ultimately, I hope to properly support all terminals *supporting the features
-necessary for complex TUIs*. I would argue that teletypes etc. are
-fundamentally unsuitable. Most operating systems seem reasonable targets, but I
-only have Linux and FreeBSD available for testing.
+As such, Notcurses is not a drop-in Curses replacement.
 
-Whenever possible, Notcurses makes use of the Terminfo library shipped with
+Wherever possible, Notcurses makes use of the Terminfo library shipped with
 NCURSES, benefiting greatly from its portability and thoroughness.
 
 Notcurses opens up advanced functionality for the interactive user on
-workstations, phones, laptops, and tablets, at the expense of e.g.
-some industrial and retail terminals.
+workstations, phones, laptops, and tablets, possibly at the expense of e.g.
+some industrial and retail terminals. Fundamentally, Curses assumes the minimum
+and allows you (with effort) to step up, whereas Notcurses assumes the maximum
+and steps down (by itself) when necessary. The latter approach probably breaks
+on some older hardware, but the former approach results in new software looking
+like old hardware.
 
 Why use this non-standard library?
 
 * Thread safety, and efficient use in parallel programs, has been a design
   consideration from the beginning.
 
-* A svelter design than that codified by X/Open:
-  * Exported identifiers are prefixed to avoid common namespace collisions.
-  * The library object exports a minimal set of symbols. Where reasonable,
-    `static inline` header-only code is used. This facilitates compiler
-    optimizations, and reduces loader time.
+* A more orderly surface than that codified by X/Open: Exported identifiers are
+  prefixed to avoid common namespace collisions. Where reasonable,
+  `static inline` header-only code is used. This facilitates compiler
+  optimizations, and reduces loader time. Notcurses can be built without its
+  multimedia functionality, requiring a significantly lesser set of dependencies.
 
-* All APIs natively support the Universal Character Set (Unicode). The `cell`
+* All APIs natively support the Universal Character Set (Unicode). The `nccell`
   API is based around Unicode's [Extended Grapheme Cluster](https://unicode.org/reports/tr29/) concept.
 
 * Visual features including images, fonts, video, high-contrast text, sprites,
   and transparent regions. All APIs natively support 24-bit color, quantized
   down as necessary for the terminal.
+
+* Portable support for bitmapped graphics, using Sixel, Kitty,
+  and even the Linux framebuffer console.
+
+* Support for unambiguous [keyboard protocols](https://sw.kovidgoyal.net/kitty/keyboard-protocol/).
+
+* "TUI mode" facilitates high-performance, non-scrolling, full-screen
+  applications. "CLI mode" supports scrolling output for shell utilities,
+  but with the full power of Notcurses.
 
 * It's Apache2-licensed in its entirety, as opposed to the
   [drama in several acts](https://invisible-island.net/ncurses/ncurses-license.html)
@@ -93,213 +95,506 @@ Why use this non-standard library?
   as "a restatement of MIT-X11").
 
 Much of the above can be had with NCURSES, but they're not what NCURSES was
-*designed* for. The most fundamental advantage in my mind, though, is
-that Notcurses is of the multithreaded era. On the other hand, if you're
-targeting industrial or critical applications, or wish to benefit from the
-time-tested reliability and portability of Curses, you should by all means use
-that fine library.
+*designed* for. On the other hand, if you're targeting industrial or critical
+applications, or wish to benefit from time-tested reliability and
+portability, you should by all means use that fine library.
 
 ## Requirements
 
-* (build) A C11 and a C++17 compiler
-* (build) CMake 3.14.0+
-* (build+runtime) From NCURSES: terminfo 6.1+
+Minimum versions generally indicate the oldest version I've tested with; it
+may well be possible to use still older versions. Let me know of any successes!
+
+* (build) CMake 3.21.0+ and a C17 compiler
+* (OPTIONAL) (OpenImageIO, testing, C++ bindings): A C++17 compiler
+* (build+runtime) From [NCURSES](https://invisible-island.net/ncurses/announce.html): terminfo 6.1+
+* (build+runtime) GNU [libunistring](https://www.gnu.org/software/libunistring/) 0.9.10+
+* (OPTIONAL) (build+runtime) [libgpm](https://www.nico.schottelius.org/software/gpm/) 1.20+
 * (OPTIONAL) (build+runtime) From QR-Code-generator: [libqrcodegen](https://github.com/nayuki/QR-Code-generator) 1.5.0+
-* (OPTIONAL) (build+runtime) From [FFMpeg](https://www.ffmpeg.org/): libswscale 5.0+, libavformat 57.0+, libavutil 56.0+
-* (OPTIONAL) (build+runtime) [OpenImageIO](https://github.com/OpenImageIO/oiio) 2.1+
+* (OPTIONAL) (build+runtime) From [FFmpeg](https://www.ffmpeg.org/): libswscale 5.0+, libavformat 57.0+, libavutil 56.0+, libavdevice 57.0+
+* (OPTIONAL) (build+runtime) [OpenImageIO](https://github.com/OpenImageIO/oiio) 2.15.0+, requires C++
 * (OPTIONAL) (testing) [Doctest](https://github.com/onqtam/doctest) 2.3.5+
 * (OPTIONAL) (documentation) [pandoc](https://pandoc.org/index.html) 1.19.2+
-* (OPTIONAL) (python bindings): Python 3.7+, [CFFI](https://pypi.org/project/cffi/) 1.13.2+
-* (OPTIONAL) (rust bindings): rust 1.40.0+, cargo 0.40.0+, [bindgen](https://crates.io/crates/bindgen) 0.53.0+
-* (runtime) Linux 5.3+
+* (OPTIONAL) (python bindings): Python 3.7+, [CFFI](https://pypi.org/project/cffi/) 1.13.2+, [pypandoc](https://pypi.org/project/pypandoc/) 1.5+
+* (runtime) Linux 2.6+, FreeBSD 11+, DragonFly BSD 5.9+, Windows 10 v1093+, or macOS 11.4+
 
-### Building
+More information on building and installation is available in [INSTALL.md](INSTALL.md).
 
-* Create a subdirectory, traditionally `build`. Enter the directory.
-* `cmake ..`. You might want to set e.g. `CMAKE_BUILD_TYPE`.
-* `make`
-* `make test`
+### Wrappers
 
-The default multimedia engine is FFmpeg. You can select a different engine
-using `USE_MULTIMEDIA`. Valid values are `ffmpeg`, `oiio` (for OpenImageIO),
-or `none`.
+If you wish to use a language other than C to work with Notcurses, numerous
+wrappers are available. Several are included in this repository, while
+others are external.
 
-If you have unit test failures, *please* file a bug including the output of
-`./notcurses-tester > log 2>&1` (`make test` also runs `notcurses-tester`, but
-hides important output).
-
-To watch the bitchin' demo, run `./notcurses-demo -p ../data`. More details can
-be found on the `notcurses-demo(1)` man page.
+| Language | Lead(s)                       | Repository |
+| -------- | ----------------------------- | ---------- |
+| Ada      | Jeremy Grosser                | [JeremyGrosser/notcursesada](https://github.com/JeremyGrosser/notcursesada) |
+| C++      | Marek Habersack, nick black   | internal   |
+| Dart     | Nelson Fernandez              | [kascote/dart_notcurses](https://github.com/kascote/dart_notcurses) |
+| Julia    | Dheepak Krishnamurthy         | [kdheepak/Notcurses.jl](https://github.com/kdheepak/Notcurses.jl) |
+| Nim      | Michael S. Bradley, Jr.       | [michaelsbradleyjr/nim-notcurses](https://github.com/michaelsbradleyjr/nim-notcurses) |
+| Python   | nick black                    | internal   |
+| Python   | igo95862                      | internal   |
+| Rust     | José Luis Cruz                | [dankamongmen/libnotcurses-sys](https://github.com/dankamongmen/libnotcurses-sys) |
+| Zig      | Jakub Dundalek                | [dundalek/notcurses-zig-example](https://github.com/dundalek/notcurses-zig-example) |
 
 ## Included tools
 
-Six binaries are installed as part of notcurses:
+Nine executables are installed as part of Notcurses:
+* `ncls`: an `ls` that displays multimedia in the terminal
+* `ncneofetch`: a [neofetch](https://github.com/dylanaraps/neofetch) ripoff
+* `ncplayer`: renders visual media (images/videos)
+* `nctetris`: a tetris clone
 * `notcurses-demo`: some demonstration code
-* `notcurses-view`: renders visual media (images/videos)
+* `notcurses-info`: detect and print terminal capabilities/diagnostics
 * `notcurses-input`: decode and print keypresses
-* `notcurses-planereels`: play around with ncreels
 * `notcurses-tester`: unit testing
-* `notcurses-tetris`: a tetris clone
+* `tfman`: a swank manual browser
 
-To run `notcurses-demo` from a checkout, provide the `tests/` directory via
+To run `notcurses-demo` from a checkout, provide the `data` directory via
 the `-p` argument. Demos requiring data files will otherwise abort. The base
 delay used in `notcurses-demo` can be changed with `-d`, accepting a
 floating-point multiplier. Values less than 1 will speed up the demo, while
 values greater than 1 will slow it down.
 
-`notcurses-tester` expects `../tests/` to exist, and be populated with the
-necessary data files. It can be run by itself, or via `make test`.
+`notcurses-tester` likewise requires that `data`, populated with the necessary
+data files, be specified with `-p`. It can be run by itself, or via `make test`.
 
-## Differences from NCURSES
+## Documentation
 
-The biggest difference, of course, is that notcurses is not an implementation
-of X/Open (aka XSI) Curses, nor part of SUS4-2018.
+With `-DUSE_PANDOC=on` (the default), a full set of man pages and XHTML
+will be built from `doc/man`. The following Markdown documentation is included
+directly:
 
-The detailed differences between notcurses and NCURSES probably can't be fully
-enumerated, and if they could, no one would want to read them. With that said,
-some design decisions might surprise NCURSES programmers:
+* Per-release [News](NEWS.md) for packagers, developers, and users.
+* The `TERM` environment variable and [various terminal emulators](TERMINALS.md).
+* Notes on [contributing](CONTRIBUTING.md) and [hacking](doc/HACKING.md).
+* There's a semi-complete [reference guide](USAGE.md).
+* A list of [other TUI libraries](doc/OTHERS.md).
+* Abbreviated [history](doc/HISTORY.md) and thanks.
+* [Differences from](doc/CURSES.md) Curses and adapting Curses programs.
 
-* There is no distinct `PANEL` type. The z-buffer is a fundamental property,
-  and all drawable surfaces are ordered along the z axis. There is no
-  equivalent to `update_panels()`.
-* Scrolling is disabled by default, and cannot be globally enabled.
-* The Curses `cchar_t` has a fixed-size array of `wchar_t`. The notcurses
-  `cell` instead supports a UTF-8 encoded extended grapheme cluster of
-  arbitrary length. The only supported charsets are `ANSI_X3.4-1968` and
-  `UTF-8`.
-* The hardware cursor is disabled by default, when supported (`civis` capability).
-* Echoing of input is disabled by default, and `cbreak` mode is used by default.
-* Colors are always specified as 24 bits in 3 components (RGB). If necessary,
-  these will be quantized for the actual terminal. There are no "color pairs".
-* There is no distinct "pad" concept (these are NCURSES `WINDOW`s created with
-  the `newpad()` function). All drawable surfaces can exceed the display size.
-* Multiple threads can freely call into notcurses, so long as they're not
-  accessing the same data. In particular, it is always safe to concurrently
-  mutate different `ncplane`s in different threads.
-* NCURSES has thread-ignorant and thread-semi-safe versions, trace-enabled and
-  traceless versions, and versions with and without support for wide characters.
-  notcurses is one library: no tracing, UTF-8, thread safety.
-* There is no `ESCDELAY` concept; notcurses expects that all bytes of a
-  keyboard escape sequence arrive at the same time. This improves latency
-  and simplifies the API.
-* It is an error in NCURSES to print to the bottommost, rightmost coordinate of
-  the screen when scrolling is disabled (because the cursor cannot be advanced).
-  Failure to advance the cursor does not result in an error in notcurses (but
-  attempting to print at the cursor when it has been advanced off the plane
-  *does*).
-
-### Features missing relative to NCURSES
-
-This isn't "features currently missing", but rather "features I do not intend
-to implement".
-
-* There is no support for soft labels (`slk_init()`, etc.).
-* There is no concept of subwindows which share memory with their parents.
-* There is no tracing functionality ala `trace(3NCURSES)`. Superior external
-  tracing solutions exist, such as `bpftrace`.
-
-### Adapting NCURSES programs
-
-Do you really want to do such a thing? NCURSES and the Curses API it implements
-are far more portable and better-tested than notcurses is ever likely to be.
-Will your program really benefit from notcurses's advanced features? If not,
-it's probably best left as it is.
-
-Otherwise, most NCURSES concepts have clear partners in notcurses. Any functions
-making implicit use of `stdscr` ought be replaced with their explicit
-equivalents. `stdscr` ought then be replaced with the result of
-`notcurses_stdplane()` (the standard plane). `PANEL`s become `ncplane`s; the
-Panels API is otherwise pretty close. Anything writing a bare character will
-become a simple `cell`; multibyte or wide characters become complex `cell`s.
-Color no longer uses "color pairs". You can easily enough hack together a
-simple table mapping your colors to RGB values, and color pairs to foreground
-and background indices into said table. That'll work for the duration of a
-porting effort, certainly.
-
-I have adapted two large (~5k lines of C UI code each) programs from NCURSES to
-notcurses, and found it a fairly painless process. It was helpful to introduce
-a shim layer, e.g. `compat_mvwprintw` for NCURSES's `mvwprintw`:
-
-```c
-static int
-compat_mvwprintw(struct ncplane* nc, int y, int x, const char* fmt, ...){
-  va_list va;
-  va_start(va, fmt);
-  if(ncplane_vprintf_yx(nc, y, x, fmt, va) < 0){
-    va_end(va);
-    return ERR;
-  }
-  va_end(va);
-  return OK;
-}
-```
-
-These are pretty obvious, implementation-wise.
+If you (understandably) want to avoid the large Pandoc stack, but still enjoy
+manual pages, I publish a tarball with generated man/XHTML along with
+each release. Download it, and install the contents as you deem fit.
 
 ## Environment notes
 
+* If your `TERM` variable is wrong, or that terminfo definition is out-of-date,
+  you're going to have a very bad time. Use *only* `TERM` values appropriate
+  for your terminal. If this variable is undefined, or Notcurses can't load the
+  specified Terminfo entry, it will refuse to start, and you will
+  [not be going to space today](https://xkcd.com/1133/).
+
+* Notcurses queries the terminal on startup, enabling some advanced features
+  based on the determined terminal (and even version). Basic capabilities,
+  however, are taken from Terminfo. So if you have, say, Kitty, but
+  `TERM=vt100`, you're going to be able to draw RGBA bitmap graphics (despite
+  such things being but a dream for a VT100), but *unable* to use the alternate
+  screen (despite it being supported by every Kitty version). So `TERM` and an
+  up-to-date Terminfo database remain important.
+
+* Ensure your `LANG` environment variable is set to a UTF8-encoded locale, and
+  that this locale has been generated. This usually means
+  `"[language]_[Countrycode].UTF-8"`, i.e. `en_US.UTF-8`. The first part
+  (`en_US`) ought exist as a directory or symlink in `/usr/share/locales`.
+  This usually requires editing `/etc/locale.gen` and running `locale-gen`.
+  On Debian systems, this can be accomplished with `dpkg-reconfigure locales`,
+  and enabling the desired locale. The default locale is stored somewhere like
+  `/etc/default/locale`.
+
 * If your terminal has an option about default interpretation of "ambiguous-width
   characters" (this is actually a technical term from Unicode), ensure it is
-  set to **Wide**, not narrow. If that doesn't work, ensure it is set to
-  **Narrow**, heh.
+  set to **Wide**, not narrow (if that doesn't work, ensure it is set to
+  **Narrow**, heh).
 
-* If you can disable BiDi in your terminal, do so while running notcurses
-  applications, until I have that handled better. notcurses doesn't recognize
-  the BiDi state machine transitions, and thus merrily continues writing
-  left-to-right. Likewise, ultra-wide glyphs will have interesting effects.
-  ﷽!
-
-* The unit tests assume dimensions of at least 80x24. They might work in a
-  smaller terminal. They might not. Don't file bugs on it.
-
-### TrueColor detection
-
-notcurses aims to use only information found in the terminal's terminfo entry to detect capabilities, TrueColor
-being one of them. Support for this is indicated by terminfo having a flag, added in NCURSES 6.1, named `RGB` set
-to `true`. However, as of today there are few and far between terminfo entries which have the capability in their
-database entry and so TrueColor won't be used in most cases. Terminal emulators have had for years a kludge to
-work around this limitation of terminfo in the form of the `COLORTERM` environment variable which, if set to either
-`truecolor` or `24bit` does the job of indicating the capability of sending the escapes 48 and 38 together with a
-tripartite RGB (0 ≤ c ≤ 255 for all three components) to specify fore- and background colors.
-Checking for `COLORTERM` admittedly goes against the goal stated at the top of this section but, for all practical
-purposes, makes the detection work quite well **today**.
+* If your terminal supports 3x8bit RGB color via `setaf` and `setbf` (most
+  modern terminals), but exports neither the `RGB` nor `Tc` terminfo capability,
+  you can export the `COLORTERM` environment variable as `truecolor` or `24bit`.
+  Note that some terminals accept a 24-bit specification, but map it down to
+  fewer colors. RGB is unconditionally enabled whenever
+  [most modern terminals](TERMINALS.md) are identified.
 
 ### Fonts
 
-Fonts end up being a whole thing, little of which is pleasant. I'll write this
-up someday **FIXME**.
+Glyph width, and indeed whether a glyph can be displayed at all, is dependent
+in part on the font configuration. Ideally, your font configuration has a
+glyph for every Unicode EGC, and each glyph's width matches up with the POSIX
+function's `wcswidth()` result for the EGC. If this is not the case, you'll
+likely get blanks or � (U+FFFD, REPLACEMENT CHARACTER) for missing characters,
+and subsequent characters on the line may be misplaced.
 
-### FAQs
+It is worth knowing that several terminals draw the block characters directly,
+rather than loading them from a font. This is generally desirable. Quadrants,
+sextants, and octants are not the place to demonstrate your design virtuosity.
+To inspect your environment's rendering of drawing characters, run
+`notcurses-info`. The desired output ought look something like this:
 
-* *Q:* Why didn't you just use Sixel?
-* *A:* Many terminal emulators don't support Sixel. Sixel doesn't work well
-       with mouse selection. With that said, I do intend to support Sixel soon,
-       as a backend, when available, for certain types of drawing.
+<p align="center">
+<img src="https://raw.githubusercontent.com/dankamongmen/notcurses/gh-pages/notcurses-info.png" alt="notcurses-info can be used to check Unicode drawing"/>
+</p>
 
-* *Q:* I'm not seeing `NCKEY_RESIZE` until I press some other key.
-* *A:* You've almost certainly failed to mask `SIGWINCH` in some thread, and
-       that thread is receiving the signal instead of the thread which called
-       `notcurses_getc_blocking()`. As a result, the `poll()` is not
-       interrupted. Call `pthread_sigmask()` before spawning any threads.
+## FAQs
 
-* *Q:* One of the demos claimed to spend more than 100% of its runtime rendering. Do you know how to count?
-* *A:* Runtime is wall clock time. A multithreaded demo can spend more than the wall-clock time rendering if the threads contend.
+If things break or seem otherwise lackluster, **please** consult the
+[Environment Notes](#environment-notes) section! You **need** correct
+`TERM` and `LANG` definitions, and might want `COLORTERM`.
 
-* *Q:* Using the C++ wrapper, how can I ensure that the `NotCurses` destructor is run when I return from `main()`?
-* *A:* As noted in the [C++ FAQ](https://isocpp.org/wiki/faq/dtors#artificial-block-to-control-lifetimes), wrap it in an artificial scope (this assumes your `NotCurses` is scoped to `main()`).
+<details>
+ <summary>Can I use Notcurses in my closed-source program?</summary>
+ Notcurses is licensed under <a href="https://www.apache.org/licenses/LICENSE-2.0">Apache2</a>,
+ a demonstration that I have transcended your petty world of material goods,
+ fiat currencies, and closed sources. Implement Microsoft Bob in it. Charge
+ rubes for it. Put it in your ballistic missiles so that you have a nice LED
+ display of said missile's speed and projected yield; right before impact,
+ scroll "FUCK YOU" in all the world's languages, and close it out with a smart
+ palette fade. Carve the compiled objects onto bricks and mail them to Richard
+ Stallman, taunting him through a bullhorn as you do so.
+</details>
 
-* *Q:* How do I hide a plane I want to make visible later?
-* *A:* Either move it above and to the left of the screen (preventing resizes from making it visible), or place it underneath another (opaque) plane.
+<details>
+  <summary>Can I write a CLI program (scrolling, fits in with the shell, etc.)
+   with Notcurses?</summary>
+   Yes! Use the <code>NCOPTION_CLI_MODE</code> flag (an alias for several
+   real flags; see <a href="https://notcurses.com/notcurses_init.3.html"><code>notcurses_init(1)</code></a>
+   for more information). You still must explicitly render.
+</details>
 
-* *Q:* Why isn't there an `ncplane_box_yx()`? Do you hate orthogonality, you dullard?
-* *A:* `ncplane_box()` and friends already have far too many arguments, you monster.
+<details>
+  <summary>Can I have Notcurses without this huge multimedia stack?</summary>
+  Again yes! Build with <code>-DUSE_MULTIMEDIA=none</code>.
+</details>
 
-* *Q:* You seem a creative guy. Why the least creative name ever?
-* *A:* I really didn't expect this to go anywhere.
+<details>
+  <summary>Can I build this individual Notcurses program without aforementioned
+  multimedia stack?</summary>
+  Almost unbelievably, yes! Use <code>notcurses_core_init()</code> or
+  <code>ncdirect_core_init()</code> in place of <code>notcurses_init()</code>/
+  <code>ncdirect_init()</code>, and link with <code>-lnotcurses-core</code>.
+  Your application will likely start a few milliseconds faster;
+  more importantly, it will link against minimal Notcurses installations.
+</details>
 
-## Supplemental material
+<details>
+  <summary>We're paying by the electron, and have no C++ compiler. Can we still
+  enjoy Notcurses goodness?</summary>
+  Some of it! You won't be able to build several executables, nor the NCPP C++
+  wrappers, nor can you build with the OpenImageIO multimedia backend (OIIO
+  ships C++ headers). You'll be able to build the main library, though, as
+  well as <code>notcurses-demo</code> (and maybe a few other programs).
+  Use <code>-DUSE_CXX=off</code>.
+</details>
 
-### Useful links
+<details>
+  <summary>Do I want ffmpeg or OpenImageIO?</summary>
+  While OpenImageIO is a superb library for dealing with single-frame images,
+  its video support is less than perfect (blame me; I've been promising Larry
+  I'd rewrite it for several months), and in any case implemented
+  atop...ffmpeg. ffmpeg is the preferred multimedia backend.
+</details>
+
+<details>
+  <summary>Does it work with hardware terminals?</summary>
+  With the correct <code>TERM</code> value, many hardware terminals are
+  supported. In general, if the terminfo database entry indicates mandatory
+  delays, Notcurses will not currently support that terminal properly. It's
+  known that Notcurses can drive the VT320 and VT340, including Sixel graphics
+  on the latter.
+</details>
+
+<details>
+  <summary>What happens if I try blitting bitmap graphics on a terminal which
+  doesn't support them?</summary>
+  Notcurses will not make use of bitmap protocols unless the terminal positively
+  indicates support for them, even if <code>NCBLIT_PIXEL</code> has been
+  requested. Likewise, sextants (<code>NCBLIT_3x2</code>) won't be used without
+  Unicode 13 support, octants (<code>NCBLIT_4x2</code>) won't be used without
+  Unicode 16 support, etc. <code>ncvisual_blit()</code> will use the best blitter
+  available, unless <code>NCVISUAL_OPTION_NODEGRADE</code> is provided (in
+  which case it will fail).
+</details>
+
+<details>
+  <summary>Notcurses looks like absolute crap in <code>screen</code>.</summary>
+  <code>screen</code> doesn't support RGB colors (at least as of 4.08.00);
+  if you have <code>COLORTERM</code> defined, you'll have a bad time.
+    If you have a <code>screen</code> that was compiled with
+    <code>--enable-colors256</code>, try exporting
+    <code>TERM=screen-256color</code> as opposed to <code>TERM=screen</code>.
+</details>
+
+<details>
+  <summary>Notcurses looks like absolute crap in <code>mosh</code>.</summary>
+  Yeah it sure does. I'm not yet sure what's up.
+</details>
+
+<details>
+  <summary>Notcurses looks like absolute crap in Windows Terminal.</summary>
+  Go to <a href="ms-settings:regionlanguage">Language Setting</a>, click
+  "Administrative language settings", click "Change system locale", and check
+  the "Beta: Use Unicode UTF-8 for worldwide language support" option. Restart
+  the computer. That ought help a little bit. Try playing with fonts—Cascadia
+  Code and Cascadia Mono both seem to work well (quadrants and Braille both
+  work), whereas Consolas and Courier New both have definite problems.
+</details>
+
+<details>
+  <summary>I'm getting strange and/or duplicate inputs in Kitty/foot.</summary>
+  Notcurses supports Kitty's powerful
+  <a href="https://sw.kovidgoyal.net/kitty/keyboard-protocol/">keyboard protocol</a>,
+  which includes things like key release events and modifier keypresses by
+  themselves. This means, among other things, that a program in these terminals
+  will usually immediately get an <code>NC_ENTER</code> <code>NCTYPE_RELEASE</code>
+  event, and each keypress will typically result in at least two inputs.
+</details>
+
+<details>
+  <summary>Why didn't you just render everything to bitmaps?</summary>
+  That's not a TUI; it's a slow and inflexible GUI. Many terminal emulators
+  don't support bitmaps. They doesn't work well with mouse selection.
+  Sixels have a limited color palette. With that said, both Sixel and the
+  Kitty bitmap protocol are well-supported.
+</details>
+
+<details>
+  <summary>My multithreaded program doesn't see <code>NCKEY_RESIZE</code> until
+  I press some other key.</summary>
+  You've almost certainly failed to mask <code>SIGWINCH</code> in some thread,
+  and that thread is receiving the signal instead of the thread which called
+  <code>notcurses_getc_blocking()</code>. As a result, the <code>poll()</code>
+  is not interrupted. Call <code>pthread_sigmask()</code> before spawning any
+  threads.
+</details>
+
+<details>
+  <summary>Using the C++ wrapper, how can I ensure that the <code>NotCurses</code>
+  destructor is run when I return from <code>main()</code>?</summary>
+  As noted in the
+  <a href="https://isocpp.org/wiki/faq/dtors#artificial-block-to-control-lifetimes">
+  C++ FAQ</a>, wrap it in an artificial scope (this assumes your
+  <code>NotCurses</code> is scoped to <code>main()</code>).
+</details>
+
+<details>
+  <summary>How do I hide a plane I want to make visible later?</summary>
+  In order of least to most performant: move it offscreen using
+  <code>ncplane_move_yx()</code>, move it underneath an opaque plane with
+  <code>ncplane_move_below()</code>, or move it off-pile with
+  <code>ncplane_reparent()</code>.
+</details>
+
+<details>
+  <summary>Why isn't there an <code>ncplane_box_yx()</code>? Do you hate
+  orthogonality, you dullard?</summary> <code>ncplane_box()</code> and friends
+  already have far too many arguments, you monster.
+</details>
+
+<details>
+  <summary>Why doesn't Notcurses support 10- or 16-bit color?</summary>
+  Notcurses supports 24 bits of color, spread across three eight-bit channels.
+  You presumably mean 10-bit-per-channel color. I needed those six bits for
+  other things. When terminals support it, Notcurses might support it.
+</details>
+
+<details>
+  <summary>The name is dumb.</summary>
+  That's not a question?
+</details>
+
+<details>
+  <summary>I'm not finding qrcodegen on BSD, despite having installed
+  <code>graphics/qr-code-generator</code>.</summary>
+  Try <code>cmake -DCMAKE_REQUIRED_INCLUDES=/usr/local/include</code>.
+  This is passed by <code>bsd.port.mk</code>.
+</details>
+
+<details>
+  <summary>Do you support <a href="https://musl.libc.org/">musl</a>?</summary>
+  I try to! You'll need at least 1.20.
+</details>
+
+<details>
+  <summary>I only seem to blit in ASCII, and/or can't emit Unicode beyond ASCII
+  in general.</summary>
+  Your <code>LANG</code> environment variable is underdefined or incorrectly
+  defined, or the necessary locale is not present on your machine (it is also
+  possible that you explicitly supplied <code>NCOPTION_INHIBIT_SETLOCALE</code>,
+  but never called <code>setlocale(3)</code>, in which case don't do that).
+</details>
+
+<details>
+  <summary>I pretty much always need an <code>ncplane</code> when using a
+  <code>nccell</code>. Why doesn't the latter hold a pointer to the former?
+  </summary>
+  Besides the massive redundancy this would entail, <code>nccell</code> needs to
+  remain as small as possible, and you almost always have the <code>ncplane</code>
+  handy if you've got a reference to a valid <code>nccell</code> anyway.
+</details>
+
+<details>
+ <summary>I ran my Notcurses program under <code>valgrind</code>/ASAN, and
+    it shows memory leaks from <code>libtinfo.so</code>, what's up with that?</summary>
+  Yeah, the NCURSES Terminfo leaks memory unless compiled a special,
+  non-standard way (see the NCURSES FAQ). It shouldn't be a substantial amount;
+  you're advised not to worry overmuch about it.
+</details>
+
+<details>
+  <summary>I ran <code>notcurses-demo</code>, but my table numbers don't match
+  the Notcurses banner numbers, you charlatan.</summary>
+  <code>notcurses-demo</code> renders several frames beyond the actual demos.
+</details>
+
+<details>
+  <summary>When my program exits, I don't have a cursor, or text is invisible,
+  or colors are weird, <i>ad nauseam</i>.</summary>
+  Ensure you're calling <code>notcurses_stop()</code>/<code>ncdirect_stop()</code>
+  on all exit paths, including fatal signals (note that, by default, Notcurses
+  installs handlers for most fatal signals to do exactly this).
+</details>
+
+<details>
+  <summary>How can I use Direct Mode in conjunction with libreadline?</summary>
+  You can't anymore (you could up until 2.4.1, but the new input system is
+  fundamentally incompatible with it). <code>ncdirect_readline()</code> still exists,
+  though, and now actually works even without libreadline, though it is of
+  course not exactly libreadline. In any case, you'd probably be better off
+  using CLI mode with a <code>ncreader</code>.
+</details>
+
+<details>
+  <summary>So is Direct Mode deprecated or what?</summary>
+  It is not currently deprecated, and definitely receives bugfixes. You are
+  probably better served using CLI mode (see above), which came about
+  somewhat late in Notcurses development (the 2.3.x series), but is superior
+  to Direct Mode in pretty much every way. The only reason to use Direct
+  Mode is if you're going to have other programs junking up your display.
+</details>
+
+<details>
+  <summary>Direct Mode sounds fast! Since it's, like, direct.</summary>
+  Direct mode is <i>substantially slower</i> than rendered mode. Rendered
+  mode assumes it knows what's on the screen, and uses this information to
+  generate optimized sequences of escapes and glyphs. Direct mode writes
+  everything it's told to write. It is furthermore far less capable—all
+  widgets etc. are available only to rendered mode, and will definitely
+  not be extended to Direct Mode.
+</details>
+
+<details>
+  <summary>Will there ever be Java wrappers?</summary>
+  I should hope not. If you want a Java solution, try @klamonte's
+  <a href="https://jexer.sourceforge.io/">Jexer</a>. Autumn's a good
+  woman, and thorough. We seem to have neatly partitioned the language
+  space.
+</details>
+
+<details>
+  <summary>Given that the glyph channel is initialized as transparent for a
+  plane, shouldn't the foreground and background be initialized as transparent,
+  also?</summary>
+  Probably (they are instead by default initialized to opaque). This would change
+  some of the most longstanding behavior of Notcurses, though,
+  so it isn't happening.
+</details>
+
+<details>
+  <summary>I get linker errors when statically linking.</summary>
+  Are you linking all necessary libraries? Use
+  <code>pkg-config --static --libs notcurses</code>
+  (or <code>--libs notcurses-core</code>) to discover them.
+</details>
+
+<details>
+  <summary>Notcurses exits immediately in MSYS2/Cygwin.</summary>
+  Notcurses requires the
+  <a href="https://devblogs.microsoft.com/commandline/windows-command-line-introducing-the-windows-pseudo-console-conpty/">Windows ConPTY</a>
+  layer. This is available in Cygwin by default since 3.2.0, but is disabled
+  by default in MSYS. Launch <code>mintty</code> with <code>-P on</code>
+  arguments, or export <code>MSYS=enable_pcon</code> before launching it.
+</details>
+
+<details>
+  <summary>Can I avoid manually exporting <code>COLORTERM=24bit</code>
+  everywhere?</summary>
+  Sure. Add <code>SendEnv COLORTERM</code> to <code>.ssh/config</code>, and
+  <code>AcceptEnv COLORTERM</code> to <code>sshd_config</code> on the remote
+  server. Yes, this will probably require root on the remote server.
+  Don't blame me, man; I didn't do it.
+</details>
+
+<details>
+  <summary>How about <i>arbitrary image manipulation here</i> functionality?</summary>
+  I'm not going to beat ImageMagick et al. on image manipulation, but you can
+  load an <code>ncvisual</code> from RGBA memory using
+  <code>ncvisual_from_rgba()</code>.
+</details>
+
+<details>
+  <summary>My program locks up during initialization. </summary>
+  Notcurses interrogates the terminal. If the terminal doesn't reply to standard
+  interrogations, file a Notcurses bug, send upstream a patch, or use a different
+  terminal. No known terminal emulators exhibit this behavior.
+</details>
+
+<details>
+  <summary>How can I draw a large plane, and only make a portion of it visible?</summary>
+  The simplest way is probably to create a plane of the same dimensions immediately above
+  the plane, and keep a region of it transparent, and the rest opaque. If you want the visible
+  area to stay in the same place on the display, but the portion being seen to change, try
+  making a plane twice as large in each dimension as the original plane. Make the desired area
+  transparent, and the rest opaque. Now move the original plane behind this plane so that the
+  desired area lines up with the &ldquo;hole&rdquo;.
+</details>
+
+<details>
+  <summary>Why no <code>NCSTYLE_REVERSE</code>?</summary>
+  It would consume a precious bit. You can use <code>ncchannels_reverse()</code>
+  to correctly invert fore- and background colors.
+</details>
+
+<details>
+  <summary>How do I mix Rendered and Direct mode?</summary>
+  You really don't want to. You can stream a subprocess to a plane with the
+  <code>ncsubproc</code> widget.
+</details>
+
+<details>
+  <summary>How can I clear the screen on startup in Rendered mode when not using
+  the alternate screen?</summary>
+  Call <code>notcurses_refresh()</code> after <code>notcurses_init()</code>
+  returns successfully.
+</details>
+
+<details>
+  <summary>Why do the stats show more Linux framebuffer bitmap bytes written
+  than total bytes written to the terminal? And why don't Linux console
+  graphics work when I ssh?</summary>
+  Linux framebuffer graphics aren't implemented via terminal writes, but rather
+  writes directly into a memory map. This memory map isn't available on remote
+  machines, and these writes aren't tracked by the standard statistics.
+</details>
+
+<details>
+ <summary>What is the possessive form of Notcurses?</summary>
+ <b>Notcurses'.</b> I cite <a href="https://en.wikipedia.org/wiki/Garner%27s_Modern_English_Usage">
+ Garner's Modern English Usage</a> in its third edition: "<b>POSSESSIVES. A. Singular
+ Possessives.</b>…Biblical and Classical names that end with a /zəs/ or /eez/
+ sound take only the apostrophe." Some ask: is Notcurses then Biblical, or is it
+ Classical? Truly, it is both.
+</details>
+
+<details>
+  <summary>I just want to display a bitmap on my terminal. Your library is
+  complex and stupid. You are simple and stupid.</summary>
+  If you're willing to call a binary, use <tt>ncplayer</tt> to put an image,
+  with desired scaling, anywhere on the screen and call it a day. Otherwise,
+  call <tt>notcurses_init()</tt>, <tt>ncvisual_from_file()</tt>,
+  <tt>ncvisual_blit()</tt>, <tt>notcurses_render()</tt>, and
+  <tt>notcurses_stop()</tt>. It's not too tough. And thanks—your thoughtful
+  comments and appreciative tone are why I work on Free Software.
+</details>
+
+## Useful links
 
 * [BiDi in Terminal Emulators](https://terminal-wg.pages.freedesktop.org/bidi/)
 * [The Xterm FAQ](https://invisible-island.net/xterm/xterm.faq.html)
@@ -308,81 +603,21 @@ up someday **FIXME**.
 * [ECMA-35 Character Code Structure and Extension Techniques](https://www.ecma-international.org/publications/standards/Ecma-035.htm) (ISO/IEC 2022)
 * [ECMA-43 8-bit Coded Character Set Structure and Rules](https://www.ecma-international.org/publications/standards/Ecma-043.htm)
 * [ECMA-48 Control Functions for Coded Character Sets](https://www.ecma-international.org/publications/standards/Ecma-048.htm) (ISO/IEC 6429)
-* [Unicode 12.1 Full Emoji List](https://unicode.org/emoji/charts/full-emoji-list.html)
+* [Unicode 14.0 Full Emoji List](https://unicode.org/emoji/charts/full-emoji-list.html)
 * [Unicode Standard Annex #29 Text Segmentation](http://www.unicode.org/reports/tr29)
 * [Unicode Standard Annex #15 Normalization Forms](https://unicode.org/reports/tr15/)
+* [mintty tips](https://github.com/mintty/mintty/wiki/Tips)
 * [The TTY demystified](http://www.linusakesson.net/programming/tty/)
 * [Dark Corners of Unicode](https://eev.ee/blog/2015/09/12/dark-corners-of-unicode/)
 * [UTF-8 Decoder Capability and Stress Test](https://www.cl.cam.ac.uk/~mgk25/ucs/examples/UTF-8-test.txt)
-
-#### Useful man pages
-* Linux: [console_codes(4)](http://man7.org/linux/man-pages/man4/console_codes.4.html)
-* Linux: [termios(3)](http://man7.org/linux/man-pages/man3/termios.3.html)
-* Linux: [ioctl_tty(2)](http://man7.org/linux/man-pages/man2/ioctl_tty.2.html)
-* Linux: [ioctl_console(2)](http://man7.org/linux/man-pages/man2/ioctl_console.2.html)
-* Portable: [terminfo(5)](http://man7.org/linux/man-pages/man5/terminfo.5.html)
-* Portable: [user_caps(5)](http://man7.org/linux/man-pages/man5/user_caps.5.html)
-
-### History
-
-* 2020-04-19: Notcurses is [accepted into Debian](https://bugs.debian.org/950492).
-* 2020-04-12: Notcurses [1.3.0 "hypnotize"](https://github.com/dankamongmen/notcurses/releases/tag/v1.3.0).
-* 2020-04-08: The Notcurses book [is published](https://amazon.com/dp/B086PNVNC9).
-* 2020-03-23: Notcurses is featured on [Linux World News](https://lwn.net/Articles/815811/).
-* 2020-02-17: Notcurses [1.2.0 "check the résumé, my record's impeccable"](https://github.com/dankamongmen/notcurses/releases/tag/v1.2.0).
-* 2019-01-19: Notcurses [1.1.0 "all the hustlas they love it just to see one of us make it"](https://github.com/dankamongmen/notcurses/releases/tag/v1.1.0).
-    Much better video support, pulsing planes, palette256.
-* 2019-01-04: Notcurses [1.0.0 "track team, crack fiend, dying to geek"](https://github.com/dankamongmen/notcurses/releases/tag/v1.0.0)
-    is released, six days ahead of schedule. 147 issues closed. 702 commits.
-* 2019-12-18: Notcurses [0.9.0 "You dig in! You dig out! You get out!"](https://github.com/dankamongmen/notcurses/releases/tag/v0.9.0),
-    and also the first contributor besides myself (@grendello). Last major
-    pre-GA release.
-* 2019-12-05: Notcurses [0.4.0 "TRAP MUSIC ALL NIGHT LONG"](https://github.com/dankamongmen/notcurses/releases/tag/v0.4.0),
-    the first generally usable notcurses. I prepare a [demo](https://www.youtube.com/watch?v=eEv2YRyiEVM),
-    and release it on YouTube.
-* November 2019: I begin work on [Outcurses](https://github.com/dankamongmen/ncreels).
-    Outcurses is a collection of routines atop NCURSES, including ncreels.
-    I study the history of NCURSES, primarily using Thomas E. Dickey's FAQ and
-    the mailing list archives.
-    * 2019-11-14: I file [Outcurses issue #56](https://github.com/dankamongmen/ncreels/issues/56)
-      regarding use of TrueColor in outcurses. This is partially inspired by
-      Lexi Summer Hale's essay [everything you ever wanted to know about terminals](http://xn--rpa.cc/irl/term.html).
-      I get into contact with Thomas E. Dickey and confirm that what I'm hoping
-      to do doesn't really fit in with the codified Curses API.
-    * 2019-11-16: I make the [first commit](https://github.com/dankamongmen/notcurses/commit/635d7039d79e4f94ba645e8cb601e3a6d82a6b30)
-      to Notcurses.
-* September 2019: I extracted fade routines from Growlight and Omphalos, and
-    offered them to NCURSES as extensions. They are not accepted, which is
-    understandable. I mention that I intend to extract ncreels, and offer to
-    include them in the CDK (Curses Development Kit). [Growlight issue #43](https://github.com/dankamongmen/growlight/issues/43)
-    is created regarding this extraction. A few minor patches go into NCURSES.
-* 2011, 2013: I develop [Growlight](https://github.com/dankamongmen/growlight)
-    and [Omphalos](https://github.com/dankamongmen/omphalos), complicated TUIs
-    making extensive use of NCURSES.
-
-### Thanks
-
-* Notcurses could never be what it is without decades of tireless, likely
-    thankless work by Thomas E. Dickey on NCURSES. His FAQ is a model of
-    engineering history. He exemplifies documentation excellence and
-    conservative, thoughtful stewardship. The free software community owes
-    Mr. Dickey a great debt.
-* Robert Edmonds provided tremendous assistance Debianizing the package,
-    and David Cantrell did likewise for Fedora. Both are hella engineers.
-* Justine Tunney, one of my first friends at Google NYC, was always present
-    with support, and pointed out the useful memstream functionality of
-    POSIX, eliminating the need for me to cons up something similar.
-* I one night read the entirety of Lexi Summer Hale's [essays](http://xn--rpa.cc/irl/index.html),
-    and woke up intending to write notcurses.
-* NES art was lifted from [The Spriters Resource](https://www.spriters-resource.com/nes/)
-    and [NES Sprite](http://nes-sprite.resampled.ru/), the kind of sites that
-    make the Internet great. It probably violates any number of copyrights. C'est la vie.
-* Mark Ferrari, master of the pixel, for no good reason allowed me to reproduce
-    his incredible and groundbreaking color-cycling artwork. Thanks Mark!
-* Finally, the [demoscene](https://en.wikipedia.org/wiki/Demoscene) and general
-    l33t scene of the 90s and early twenty-first century endlessly inspired a
-    young hax0r. There is great joy in computing; no one will drive us from
-    this paradise Turing has created!
+* [Emoji: how do you get from U+1F355 to 🍕?](https://meowni.ca/posts/emoji-emoji-emoji/)
+* [Glyph Hell: An introduction to glyphs, as used and defined in the FreeType engine](http://chanae.walon.org/pub/ttf/ttf_glyphs.htm)
+* [Text Rendering Hates You](https://gankra.github.io/blah/text-hates-you/)
+* [Use the UTF-8 code page](https://docs.microsoft.com/en-us/windows/apps/design/globalizing/use-utf8-code-page)
+* My wiki's [Sixel page](https://nick-black.com/dankwiki/index.php?title=Sixel) and Kitty's [extensions](https://sw.kovidgoyal.net/kitty/protocol-extensions.html).
+* Linux man pages: [console_codes(4)](http://man7.org/linux/man-pages/man4/console_codes.4.html), [termios(3)](http://man7.org/linux/man-pages/man3/termios.3.html), [ioctl_tty(2)](http://man7.org/linux/man-pages/man2/ioctl_tty.2.html), [ioctl_console(2)](http://man7.org/linux/man-pages/man2/ioctl_console.2.html)
+* The Microsoft Windows [Console Reference](https://docs.microsoft.com/en-us/windows/console/console-reference)
+* NCURSES man pages: [terminfo(5)](http://man7.org/linux/man-pages/man5/terminfo.5.html), [user_caps(5)](http://man7.org/linux/man-pages/man5/user_caps.5.html)
 
 > “Our fine arts were developed, their types and uses were established, in times
 very different from the present, by men whose power of action upon things was

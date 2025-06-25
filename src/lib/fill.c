@@ -1,16 +1,16 @@
 #include "internal.h"
 
 void ncplane_greyscale(ncplane *n){
-  for(int y = 0 ; y < n->leny ; ++y){
-    for(int x = 0 ; x < n->lenx ; ++x){
-      cell* c = &n->fb[nfbcellidx(n, y, x)];
+  for(unsigned y = 0 ; y < n->leny ; ++y){
+    for(unsigned x = 0 ; x < n->lenx ; ++x){
+      nccell* c = &n->fb[nfbcellidx(n, y, x)];
       unsigned r, g, b;
-      cell_fg_rgb(c, &r, &g, &b);
+      nccell_fg_rgb8(c, &r, &g, &b);
       int gy = rgb_greyscale(r, g, b);
-      cell_set_fg_rgb(c, gy, gy, gy);
-      cell_bg_rgb(c, &r, &g, &b);
+      nccell_set_fg_rgb8(c, gy, gy, gy);
+      nccell_bg_rgb8(c, &r, &g, &b);
       gy = rgb_greyscale(r, g, b);
-      cell_set_bg_rgb(c, gy, gy, gy);
+      nccell_set_bg_rgb8(c, gy, gy, gy);
     }
   }
 }
@@ -20,162 +20,121 @@ void ncplane_greyscale(ncplane *n){
 // success. so a return of 0 means there's no work to be done here, and N means
 // we did some work here, filling everything we could reach. out-of-plane is 0.
 static int
-ncplane_polyfill_recurse(ncplane* n, int y, int x, const cell* c){
-  if(y >= n->leny || x >= n->lenx){
-    return 0; // not fillable
-  }
-  if(y < 0 || x < 0){
-    return 0; // not fillable
-  }
-  cell* cur = &n->fb[nfbcellidx(n, y, x)];
-  if(cur->gcluster){
-    return 0; // glyph, not polyfillable
-  }
-  if(cell_duplicate(n, cur, c) < 0){
+ncplane_polyfill_inner(ncplane* n, unsigned y, unsigned x, const nccell* c, const char* filltarg){
+  struct topolyfill* stack = NULL;
+  if(create_polyfill_op(y, x, &stack) == NULL){
     return -1;
   }
-  int r, ret = 1;
-  if((r = ncplane_polyfill_recurse(n, y - 1, x, c)) < 0){
-    return -1;
-  }
-  ret += r;
-  if((r = ncplane_polyfill_recurse(n, y + 1, x, c)) < 0){
-    return -1;
-  }
-  ret += r;
-  if((r = ncplane_polyfill_recurse(n, y, x - 1, c)) < 0){
-    return -1;
-  }
-  ret += r;
-  if((r = ncplane_polyfill_recurse(n, y, x + 1, c)) < 0){
-    return -1;
-  }
-  ret += r;
-  return ret;
-}
-
-// at the initial step only, invalid y, x is an error, so explicitly check.
-int ncplane_polyfill_yx(ncplane* n, int y, int x, const cell* c){
-  int ret = -1;
-  if(c->gcluster){ // can't polyfill with a null EGC
-    if(y < n->leny && x < n->lenx){
-      if(y >= 0 && x >= 0){
-        ret = ncplane_polyfill_recurse(n, y, x, c);
+  int ret = 0;
+  struct topolyfill* s;
+  do{
+    s = stack;
+    stack = stack->next;
+    y = s->y;
+    x = s->x;
+    nccell* cur = &n->fb[nfbcellidx(n, y, x)];
+    const char* glust = nccell_extended_gcluster(n, cur);
+//fprintf(stderr, "checking %d/%d (%s) for [%s]\n", y, x, glust, filltarg);
+    if(strcmp(glust, filltarg) == 0){
+      ++ret;
+      if(nccell_duplicate(n, cur, c) < 0){
+        goto err;
+      }
+//fprintf(stderr, "blooming from %d/%d ret: %d\n", y, x, ret);
+      if(y){
+        if(create_polyfill_op(y - 1, x, &stack) == NULL){
+          goto err;
+        }
+      }
+      if(y + 1 < n->leny){
+        if(create_polyfill_op(y + 1, x, &stack) == NULL){
+          goto err;
+        }
+      }
+      if(x){
+        if(create_polyfill_op(y, x - 1, &stack) == NULL){
+          goto err;
+        }
+      }
+      if(x + 1 < n->lenx){
+        if(create_polyfill_op(y, x + 1, &stack) == NULL){
+          goto err;
+        }
       }
     }
+    free(s);
+  }while(stack);
+  return ret;
+
+err:
+  free(s);
+  while(stack){
+    struct topolyfill* tmp = stack->next;
+    free(stack);
+    stack = tmp;
+  }
+  return -1;
+}
+
+// at the initial step only, invalid ystart, xstart is an error, so explicitly check.
+int ncplane_polyfill_yx(ncplane* n, int ystart, int xstart, const nccell* c){
+  if(ystart < 0){
+    if(ystart != -1){
+      logerror("invalid y: %d", ystart);
+      return -1;
+    }
+    ystart = n->y;
+  }
+  unsigned y = ystart;
+  if(xstart < 0){
+    if(xstart != -1){
+      logerror("invalid x: %d", xstart);
+      return -1;
+    }
+    xstart = n->x;
+  }
+  unsigned x = xstart;
+  if(y >= n->leny || x >= n->lenx){
+    logerror("invalid start: %u/%u (%u/%u)", y, x, n->leny, n->lenx);
+    return -1;
+  }
+  const nccell* cur = &n->fb[nfbcellidx(n, y, x)];
+  const char* targ = nccell_extended_gcluster(n, cur);
+  const char* fillegc = nccell_extended_gcluster(n, c);
+//fprintf(stderr, "checking %d/%d (%s) for [%s]\n", y, x, targ, fillegc);
+  if(strcmp(fillegc, targ) == 0){
+    return 0;
+  }
+  int ret = -1;
+  // we need an external copy of this, since we'll be writing to it on
+  // the first call into ncplane_polyfill_inner()
+  char* targcopy = strdup(targ);
+  if(targcopy){
+    ret = ncplane_polyfill_inner(n, y, x, c, targcopy);
+    free(targcopy);
   }
   return ret;
-}
-
-// Our gradient is a 2d lerp among the four corners of the region. We start
-// with the observation that each corner ought be its exact specified corner,
-// and the middle ought be the exact average of all four corners' components.
-// Another observation is that if all four corners are the same, every cell
-// ought be the exact same color. From this arises the observation that a
-// perimeter element is not affected by the other three sides:
-//
-//  a corner element is defined by itself
-//  a perimeter element is defined by the two points on its side
-//  an internal element is defined by all four points
-//
-// 2D equation of state: solve for each quadrant's contribution (min 2x2):
-//
-//  X' = (xlen - 1) - X
-//  Y' = (ylen - 1) - Y
-//  TLC: X' * Y' * TL
-//  TRC: X * Y' * TR
-//  BLC: X' * Y * BL
-//  BRC: X * Y * BR
-//  steps: (xlen - 1) * (ylen - 1) [maximum steps away from origin]
-//
-// Then add TLC + TRC + BLC + BRC + steps / 2, and divide by steps (the
-//  steps / 2 is to work around truncate-towards-zero).
-static int
-calc_gradient_component(unsigned tl, unsigned tr, unsigned bl, unsigned br,
-                        int y, int x, int ylen, int xlen){
-  assert(y >= 0);
-  assert(y < ylen);
-  assert(x >= 0);
-  assert(x < xlen);
-  const int avm = (ylen - 1) - y;
-  const int ahm = (xlen - 1) - x;
-  if(xlen < 2){
-    if(ylen < 2){
-      return tl;
-    }
-    return (tl * avm + bl * y) / (ylen - 1);
-  }
-  if(ylen < 2){
-    return (tl * ahm + tr * x) / (xlen - 1);
-  }
-  const int tlc = ahm * avm * tl;
-  const int blc = ahm * y * bl;
-  const int trc = x * avm * tr;
-  const int brc = y * x * br;
-  const int divisor = (ylen - 1) * (xlen - 1);
-  return ((tlc + blc + trc + brc) + divisor / 2) / divisor;
-}
-
-// calculate one of the channels of a gradient at a particular point.
-static inline uint32_t
-calc_gradient_channel(uint32_t ul, uint32_t ur, uint32_t ll, uint32_t lr,
-                      int y, int x, int ylen, int xlen){
-  uint32_t chan = 0;
-  channel_set_rgb_clipped(&chan,
-                         calc_gradient_component(channel_r(ul), channel_r(ur),
-                                                 channel_r(ll), channel_r(lr),
-                                                 y, x, ylen, xlen),
-                         calc_gradient_component(channel_g(ul), channel_g(ur),
-                                                 channel_g(ll), channel_g(lr),
-                                                 y, x, ylen, xlen),
-                         calc_gradient_component(channel_b(ul), channel_b(ur),
-                                                 channel_b(ll), channel_b(lr),
-                                                 y, x, ylen, xlen));
-  channel_set_alpha(&chan, channel_alpha(ul)); // precondition: all αs are equal
-  return chan;
-}
-
-// calculate both channels of a gradient at a particular point, storing them
-// into `c`->channels. x and y ought be the location within the gradient.
-static inline void
-calc_gradient_channels(cell* c, uint64_t ul, uint64_t ur, uint64_t ll,
-                       uint64_t lr, int y, int x, int ylen, int xlen){
-  if(!channels_fg_default_p(ul)){
-    cell_set_fchannel(c, calc_gradient_channel(channels_fchannel(ul),
-                                               channels_fchannel(ur),
-                                               channels_fchannel(ll),
-                                               channels_fchannel(lr),
-                                               y, x, ylen, xlen));
-  }else{
-    cell_set_fg_default(c);
-  }
-  if(!channels_bg_default_p(ul)){
-    cell_set_bchannel(c, calc_gradient_channel(channels_bchannel(ul),
-                                               channels_bchannel(ur),
-                                               channels_bchannel(ll),
-                                               channels_bchannel(lr),
-                                               y, x, ylen, xlen));
-  }else{
-    cell_set_bg_default(c);
-  }
 }
 
 static bool
 check_gradient_channel_args(uint32_t ul, uint32_t ur, uint32_t bl, uint32_t br){
-  if(channel_default_p(ul) || channel_default_p(ur) ||
-     channel_default_p(bl) || channel_default_p(br)){
-    if(!(channel_default_p(ul) && channel_default_p(ur) &&
-         channel_default_p(bl) && channel_default_p(br))){
+  if(ncchannel_default_p(ul) || ncchannel_default_p(ur) ||
+     ncchannel_default_p(bl) || ncchannel_default_p(br)){
+    if(!(ncchannel_default_p(ul) && ncchannel_default_p(ur) &&
+         ncchannel_default_p(bl) && ncchannel_default_p(br))){
+      logerror("some (not all) channels were defaults");
       return true;
     }
   }
-  if(channel_alpha(ul) != channel_alpha(ur) ||
-     channel_alpha(ur) != channel_alpha(bl) ||
-     channel_alpha(bl) != channel_alpha(br)){
+  if(ncchannel_alpha(ul) != ncchannel_alpha(ur) ||
+     ncchannel_alpha(ur) != ncchannel_alpha(bl) ||
+     ncchannel_alpha(bl) != ncchannel_alpha(br)){
+    logerror("channel alphas didn't match");
     return true;
   }
-  if(channel_palindex_p(ul) || channel_palindex_p(bl) ||
-     channel_palindex_p(br) || channel_palindex_p(ur)){
+  if(ncchannel_palindex_p(ul) || ncchannel_palindex_p(bl) ||
+     ncchannel_palindex_p(br) || ncchannel_palindex_p(ur)){
+    logerror("can't blend palette-indexed color");
     return true;
   }
   return false;
@@ -188,14 +147,13 @@ check_gradient_channel_args(uint32_t ul, uint32_t ur, uint32_t bl, uint32_t br){
 // - all foregrounds must have the same alpha
 // - all backgrounds must have the same alpha
 // - palette-indexed color must not be used
-static bool
-check_gradient_args(uint64_t ul, uint64_t ur, uint64_t bl, uint64_t br){
-  if(check_gradient_channel_args(channels_fchannel(ul), channels_fchannel(ur),
-                                 channels_fchannel(bl), channels_fchannel(br))){
+bool check_gradient_args(uint64_t ul, uint64_t ur, uint64_t bl, uint64_t br){
+  if(check_gradient_channel_args(ncchannels_fchannel(ul), ncchannels_fchannel(ur),
+                                 ncchannels_fchannel(bl), ncchannels_fchannel(br))){
     return true;
   }
-  if(check_gradient_channel_args(channels_bchannel(ul), channels_bchannel(ur),
-                                 channels_bchannel(bl), channels_bchannel(br))){
+  if(check_gradient_channel_args(ncchannels_bchannel(ul), ncchannels_bchannel(ur),
+                                 ncchannels_bchannel(bl), ncchannels_bchannel(br))){
     return true;
   }
   return false;
@@ -204,221 +162,184 @@ check_gradient_args(uint64_t ul, uint64_t ur, uint64_t bl, uint64_t br){
 // calculate both channels of a gradient at a particular point, knowing that
 // we're using double halfblocks, into `c`->channels.
 static inline void
-calc_highgradient(cell* c, uint64_t ul, uint64_t ur, uint64_t ll,
-                  uint64_t lr, int y, int x, int ylen, int xlen){
-  if(!channel_default_p(ul)){
+calc_highgradient(nccell* c, uint32_t ul, uint32_t ur, uint32_t ll,
+                  uint32_t lr, unsigned y, unsigned x,
+                  unsigned ylen, unsigned xlen){
+  if(!ncchannel_default_p(ul)){
     cell_set_fchannel(c, calc_gradient_channel(ul, ur, ll, lr,
                                                y * 2, x, ylen, xlen));
     cell_set_bchannel(c, calc_gradient_channel(ul, ur, ll, lr,
                                                y * 2 + 1, x, ylen, xlen));
   }else{
-    cell_set_fg_default(c);
-    cell_set_bg_default(c);
+    nccell_set_fg_default(c);
+    nccell_set_bg_default(c);
   }
 }
 
-int ncplane_highgradient(ncplane* n, uint32_t ul, uint32_t ur,
-                         uint32_t ll, uint32_t lr, int ystop, int xstop){
+int ncplane_gradient2x1(ncplane* n, int y, int x, unsigned ylen, unsigned xlen,
+                        uint32_t ul, uint32_t ur, uint32_t ll, uint32_t lr){
+  if(!notcurses_canutf8(ncplane_notcurses(n))){
+    logerror("highdef gradients require utf8");
+    return -1;
+  }
   if(check_gradient_channel_args(ul, ur, ll, lr)){
     return -1;
   }
-  int yoff, xoff, ymax, xmax;
-  ncplane_cursor_yx(n, &yoff, &xoff);
-  // must be at least 1x1, with its upper-left corner at the current cursor
-  if(ystop < yoff){
+  unsigned ystart, xstart;
+  if(check_geometry_args(n, y, x, &ylen, &xlen, &ystart, &xstart)){
     return -1;
   }
-  if(xstop < xoff){
-    return -1;
-  }
-  ncplane_dim_yx(n, &ymax, &xmax);
-  // must be within the ncplane
-  if(xstop >= xmax || ystop >= ymax){
-    return -1;
-  }
-  const int xlen = xstop - xoff + 1;
-  const int ylen = (ystop - yoff + 1) * 2;
   if(xlen == 1){
     if(ul != ur || ll != lr){
+      logerror("horizontal channel variation in single column");
       return -1;
     }
   }
   int total = 0;
-  for(int y = yoff ; y <= ystop ; ++y){
-    for(int x = xoff ; x <= xstop ; ++x){
-      cell* targc = ncplane_cell_ref_yx(n, y, x);
+  for(unsigned yy = ystart ; yy < ystart + ylen ; ++yy){
+    for(unsigned xx = xstart ; xx < xstart + xlen ; ++xx){
+      nccell* targc = ncplane_cell_ref_yx(n, yy, xx);
       targc->channels = 0;
-      if(cell_load(n, targc, "▀") < 0){
+      if(pool_blit_direct(&n->pool, targc, "▀", strlen("▀"), 1) <= 0){
         return -1;
       }
-      calc_highgradient(targc, ul, ur, ll, lr, y - yoff, x - xoff, ylen, xlen);
+      calc_highgradient(targc, ul, ur, ll, lr, yy - ystart, xx - xstart, ylen * 2, xlen);
       ++total;
     }
   }
   return total;
 }
 
-int ncplane_gradient(ncplane* n, const char* egc, uint32_t attrword,
-                     uint64_t ul, uint64_t ur, uint64_t bl, uint64_t br,
-                     int ystop, int xstop){
+// FIXME remove in abi3
+int ncplane_highgradient_sized(ncplane* n, uint32_t ul, uint32_t ur,
+                               uint32_t ll, uint32_t lr, int ylen, int xlen){
+  if(ylen < 1 || xlen < 1){
+    return -1;
+  }
+  if(!notcurses_canutf8(ncplane_notcurses_const(n))){
+    // this works because the uin32_ts we pass in will be promoted to uint64_ts
+    // via extension, and the space will employ the background. mwahh!
+    return ncplane_gradient(n, -1, -1, ylen, xlen, " ", 0, ul, ur, ll, lr);
+  }
+  return ncplane_gradient2x1(n, -1, -1, ylen, xlen, ul, ur, ll, lr);
+}
+
+int ncplane_gradient(ncplane* n, int y, int x, unsigned ylen, unsigned xlen,
+                     const char* egc, uint16_t stylemask,
+                     uint64_t ul, uint64_t ur, uint64_t bl, uint64_t br){
   if(check_gradient_args(ul, ur, bl, br)){
     return -1;
   }
-  if(egc == NULL){
-    return true;
-  }
-  int yoff, xoff, ymax, xmax;
-  ncplane_cursor_yx(n, &yoff, &xoff);
-  // must be at least 1x1, with its upper-left corner at the current cursor
-  if(ystop < yoff){
+  unsigned ystart, xstart;
+  if(check_geometry_args(n, y, x, &ylen, &xlen, &ystart, &xstart)){
     return -1;
   }
-  if(xstop < xoff){
-    return -1;
-  }
-  ncplane_dim_yx(n, &ymax, &xmax);
-  // must be within the ncplane
-  if(xstop >= xmax || ystop >= ymax){
-    return -1;
-  }
-  const int xlen = xstop - xoff + 1;
-  const int ylen = ystop - yoff + 1;
   if(ylen == 1){
     if(xlen == 1){
       if(ul != ur || ur != br || br != bl){
+        logerror("channel variation in 1x1 area");
         return -1;
       }
     }else{
       if(ul != bl || ur != br){
+        logerror("vertical channel variation in single row");
         return -1;
       }
     }
   }else if(xlen == 1){
     if(ul != ur || bl != br){
+      logerror("horizontal channel variation in single column");
       return -1;
     }
   }
   int total = 0;
-  for(int y = yoff ; y <= ystop ; ++y){
-    for(int x = xoff ; x <= xstop ; ++x){
-      cell* targc = ncplane_cell_ref_yx(n, y, x);
+  for(unsigned yy = ystart ; yy < ystart + ylen ; ++yy){
+    for(unsigned xx = xstart ; xx < xstart + xlen ; ++xx){
+      nccell* targc = ncplane_cell_ref_yx(n, yy, xx);
       targc->channels = 0;
-      if(cell_load(n, targc, egc) < 0){
+      if(nccell_load(n, targc, egc) < 0){
         return -1;
       }
-      targc->attrword = attrword;
-      calc_gradient_channels(targc, ul, ur, bl, br, y - yoff, x - xoff, ylen, xlen);
+      targc->stylemask = stylemask;
+      calc_gradient_channels(&targc->channels, ul, ur, bl, br,
+                             yy - ystart, xx - xstart, ylen, xlen);
       ++total;
     }
   }
   return total;
 }
 
-int ncplane_stain(struct ncplane* n, int ystop, int xstop,
+int ncplane_stain(ncplane* n, int y, int x, unsigned ylen, unsigned xlen,
                   uint64_t tl, uint64_t tr, uint64_t bl, uint64_t br){
   // Can't use default or palette-indexed colors in a gradient
   if(check_gradient_args(tl, tr, bl, br)){
     return -1;
   }
-  int yoff, xoff, ymax, xmax;
-  ncplane_cursor_yx(n, &yoff, &xoff);
-  // must be at least 1x1, with its upper-left corner at the current cursor
-  if(ystop < yoff){
+  unsigned ystart, xstart;
+  if(check_geometry_args(n, y, x, &ylen, &xlen, &ystart, &xstart)){
     return -1;
   }
-  if(xstop < xoff){
-    return -1;
-  }
-  ncplane_dim_yx(n, &ymax, &xmax);
-  // must be within the ncplane
-  if(xstop >= xmax || ystop >= ymax){
-    return -1;
-  }
-  const int xlen = xstop - xoff + 1;
-  const int ylen = ystop - yoff + 1;
   int total = 0;
-  for(int y = yoff ; y <= ystop ; ++y){
-    for(int x = xoff ; x <= xstop ; ++x){
-      cell* targc = ncplane_cell_ref_yx(n, y, x);
-      calc_gradient_channels(targc, tl, tr, bl, br, y - yoff, x - xoff, ylen, xlen);
+  for(unsigned yy = ystart ; yy < ystart + ylen ; ++yy){
+    for(unsigned xx = xstart ; xx < xstart + xlen ; ++xx){
+      nccell* targc = ncplane_cell_ref_yx(n, yy, xx);
+      if(targc->gcluster){
+        calc_gradient_channels(&targc->channels, tl, tr, bl, br,
+                               yy - ystart, xx - xstart, ylen, xlen);
+      }
       ++total;
     }
   }
   return total;
 }
 
-int ncplane_format(struct ncplane* n, int ystop, int xstop, uint32_t attrword){
-  int yoff, xoff, ymax, xmax;
-  ncplane_cursor_yx(n, &yoff, &xoff);
-  // must be at least 1x1, with its upper-left corner at the current cursor
-  if(ystop < yoff){
-    return -1;
-  }
-  if(xstop < xoff){
-    return -1;
-  }
-  ncplane_dim_yx(n, &ymax, &xmax);
-  // must be within the ncplane
-  if(xstop >= xmax || ystop >= ymax){
+int ncplane_format(ncplane* n, int y, int x, unsigned ylen,
+                   unsigned xlen, uint16_t stylemask){
+  unsigned ystart, xstart;
+  if(check_geometry_args(n, y, x, &ylen, &xlen, &ystart, &xstart)){
     return -1;
   }
   int total = 0;
-  for(int y = yoff ; y < ystop + 1 ; ++y){
-    for(int x = xoff ; x < xstop + 1 ; ++x){
-      cell* targc = ncplane_cell_ref_yx(n, y, x);
-      targc->attrword = attrword;
+  for(unsigned yy = ystart ; yy < ystart + ylen ; ++yy){
+    for(unsigned xx = xstart ; xx < xstart + xlen ; ++xx){
+      nccell* targc = ncplane_cell_ref_yx(n, yy, xx);
+      targc->stylemask = stylemask;
       ++total;
     }
   }
   return total;
 }
 
-// generate a temporary plane that can hold the contents of n, rotated 90°
-static ncplane* rotate_plane(const ncplane* n){
-  int absy, absx;
-  ncplane_yx(n, &absy, &absx);
-  int dimy, dimx;
-  ncplane_dim_yx(n, &dimy, &dimx);
-  if(dimx % 2 != 0){
-    return NULL;
-  }
-  const int newy = dimx / 2;
-  const int newx = dimy * 2;
-  ncplane* newp = ncplane_new(n->nc, newy, newx, absy, absx, n->userptr);
-  return newp;
-}
-
-// if we're a lower block, reverse the channels. if we're a space, set both to
+// if we're a half block, reverse the channels. if we're a space, set both to
 // the background. if we're a full block, set both to the foreground.
-static void
-rotate_channels(ncplane* src, const cell* c, uint32_t* fchan, uint32_t* bchan){
-  if(cell_simple_p(c)){
-    if(!isgraph(c->gcluster)){
-      *fchan = *bchan;
-    }
-    return;
-  }
-  const char* origc = cell_extended_gcluster(src, c);
-  if(strcmp(origc, "▄") == 0){
+static int
+rotate_channels(ncplane* src, const nccell* c, uint32_t* fchan, uint32_t* bchan){
+  const char* egc = nccell_extended_gcluster(src, c);
+  if(egc[0] == ' ' || egc[0] == 0){
+    *fchan = *bchan;
+    return 0;
+  }else if(strcmp(egc, "▄") == 0 || strcmp(egc, "▀") == 0){
     uint32_t tmp = *fchan;
     *fchan = *bchan;
     *bchan = tmp;
-    return;
-  }else if(strcmp(origc, "█") == 0){
+    return 0;
+  }else if(strcmp(egc, "█") == 0){
     *bchan = *fchan;
-    return;
+    return 0;
   }
+  logerror("invalid EGC for rotation [%s]", egc);
+  return -1;
 }
 
 static int
 rotate_output(ncplane* dst, uint32_t tchan, uint32_t bchan){
-  dst->channels = channels_combine(tchan, bchan);
+  dst->channels = ncchannels_combine(tchan, bchan);
   if(tchan != bchan){
     return ncplane_putegc(dst, "▀", NULL);
   }
-  if(channel_default_p(tchan) && channel_default_p(bchan)){
+  if(ncchannel_default_p(tchan) && ncchannel_default_p(bchan)){
     return ncplane_putegc(dst, "", NULL);
-  }else if(channel_default_p(tchan)){
+  }else if(ncchannel_default_p(tchan)){
     return ncplane_putegc(dst, " ", NULL);
   }
   return ncplane_putegc(dst, "█", NULL);
@@ -453,13 +374,13 @@ rotate_output(ncplane* dst, uint32_t tchan, uint32_t bchan){
 //   lower?) having the two channels as fore- and background.
 static int
 rotate_2x1_cw(ncplane* src, ncplane* dst, int srcy, int srcx, int dsty, int dstx){
-  cell c1 = CELL_TRIVIAL_INITIALIZER;
-  cell c2 = CELL_TRIVIAL_INITIALIZER;
+  nccell c1 = NCCELL_TRIVIAL_INITIALIZER;
+  nccell c2 = NCCELL_TRIVIAL_INITIALIZER;
   if(ncplane_at_yx_cell(src, srcy, srcx, &c1) < 0){
     return -1;
   }
   if(ncplane_at_yx_cell(src, srcy, srcx + 1, &c2) < 0){
-    cell_release(src, &c1);
+    nccell_release(src, &c1);
     return -1;
   }
   // there can be at most 4 colors and 4 transparencies:
@@ -473,12 +394,13 @@ rotate_2x1_cw(ncplane* src, ncplane* dst, int srcy, int srcx, int dsty, int dstx
   //     otherwise, c2bg c2btrans
   //  - botright gets topright. if topright is foreground, c2fg c2ftrans.
   //     otherwise, c2bg c2btrans
-  uint32_t c1b = cell_bchannel(&c1);
-  uint32_t c2b = cell_bchannel(&c2);
-  uint32_t c1t = cell_fchannel(&c1);
-  uint32_t c2t = cell_fchannel(&c2);
-  rotate_channels(src, &c1, &c1t, &c1b);
-  rotate_channels(src, &c2, &c2t, &c2b);
+  uint32_t c1b = cell_bchannel_common(&c1);
+  uint32_t c2b = cell_bchannel_common(&c2);
+  uint32_t c1t = cell_fchannel_common(&c1);
+  uint32_t c2t = cell_fchannel_common(&c2);
+  int ret = 0;
+  ret |= rotate_channels(src, &c1, &c1t, &c1b);
+  ret |= rotate_channels(src, &c2, &c2t, &c2b);
   // right char comes from two tops. left char comes from two bottoms. if
   // they're the same channel, they become a:
   //
@@ -488,42 +410,44 @@ rotate_2x1_cw(ncplane* src, ncplane* dst, int srcy, int srcx, int dsty, int dstx
   ncplane_cursor_move_yx(dst, dsty, dstx);
   rotate_output(dst, c1b, c2b);
   rotate_output(dst, c1t, c2t);
-  return 0;
+  return ret;
 }
 
-int rotate_2x1_ccw(ncplane* src, ncplane* dst, int srcy, int srcx, int dsty, int dstx){
-  cell c1 = CELL_TRIVIAL_INITIALIZER;
-  cell c2 = CELL_TRIVIAL_INITIALIZER;
+static int
+rotate_2x1_ccw(ncplane* src, ncplane* dst, int srcy, int srcx, int dsty, int dstx){
+  nccell c1 = NCCELL_TRIVIAL_INITIALIZER;
+  nccell c2 = NCCELL_TRIVIAL_INITIALIZER;
   if(ncplane_at_yx_cell(src, srcy, srcx, &c1) < 0){
     return -1;
   }
   if(ncplane_at_yx_cell(src, srcy, srcx + 1, &c2) < 0){
-    cell_release(src, &c1);
+    nccell_release(src, &c1);
     return -1;
   }
-  uint32_t c1b = cell_bchannel(&c1);
-  unsigned c2b = cell_bchannel(&c2);
-  unsigned c1t = cell_fchannel(&c1);
-  unsigned c2t = cell_fchannel(&c2);
-  rotate_channels(src, &c1, &c1t, &c1b);
-  rotate_channels(src, &c2, &c2t, &c2b);
+  uint32_t c1b = cell_bchannel_common(&c1);
+  unsigned c2b = cell_bchannel_common(&c2);
+  unsigned c1t = cell_fchannel_common(&c1);
+  unsigned c2t = cell_fchannel_common(&c2);
+  int ret = 0;
+  ret |= rotate_channels(src, &c1, &c1t, &c1b);
+  ret |= rotate_channels(src, &c2, &c2t, &c2b);
   ncplane_cursor_move_yx(dst, dsty, dstx);
   rotate_output(dst, c1t, c2t);
   rotate_output(dst, c1b, c2b);
-  return 0;
+  return ret;
 }
 
 // copy 'newp' into 'n' after resizing 'n' to match 'newp'
 static int
 rotate_merge(ncplane* n, ncplane* newp){
-  int dimy, dimx;
+  unsigned dimy, dimx;
   ncplane_dim_yx(newp, &dimy, &dimx);
   int ret = ncplane_resize(n, 0, 0, 0, 0, 0, 0, dimy, dimx);
   if(ret == 0){
-    for(int y = 0 ; y < dimy ; ++y){
-      for(int x = 0 ; x < dimx ; ++x){
-        const cell* src = &newp->fb[fbcellidx(y, dimx, x)];
-        cell* targ = &n->fb[fbcellidx(y, dimx, x)];
+    for(unsigned y = 0 ; y < dimy ; ++y){
+      for(unsigned x = 0 ; x < dimx ; ++x){
+        const nccell* src = &newp->fb[fbcellidx(y, dimx, x)];
+        nccell* targ = &n->fb[fbcellidx(y, dimx, x)];
         if(cell_duplicate_far(&n->pool, targ, newp, src) < 0){
           return -1;
         }
@@ -533,22 +457,48 @@ rotate_merge(ncplane* n, ncplane* newp){
   return ret;
 }
 
+// generate a temporary plane that can hold the contents of n, rotated 90°
+static ncplane*
+rotate_plane(ncplane* n){
+  int absy, absx;
+  ncplane_yx(n, &absy, &absx);
+  unsigned dimy, dimx;
+  ncplane_dim_yx(n, &dimy, &dimx);
+  if(dimx % 2 != 0){
+    return NULL;
+  }
+  const int newy = dimx / 2;
+  const int newx = dimy * 2;
+  struct ncplane_options nopts = {
+    .y = absy,
+    .x = absx,
+    .rows = newy,
+    .cols = newx,
+    .userptr = n->userptr,
+    .name = "copy",
+  };
+  ncplane* newp = ncplane_create(n, &nopts);
+  return newp;
+}
+
 int ncplane_rotate_cw(ncplane* n){
   ncplane* newp = rotate_plane(n);
   if(newp == NULL){
     return -1;
   }
-  int dimy, dimx;
+  unsigned dimy, dimx;
   ncplane_dim_yx(n, &dimy, &dimx);
+  int centy, centx;
+  ncplane_center_abs(n, &centy, &centx);
   // the topmost row consists of the leftmost two columns. the rightmost column
   // of the topmost row consists of the top half of the top two leftmost cells.
   // the penultimate column of the topmost row consists of the bottom half of
   // the top two leftmost cells. work from the bottom up on the source, so we
   // can copy to the top row from the left to the right.
   int targx, targy = 0;
-  for(int x = 0 ; x < dimx ; x += 2){
+  for(unsigned x = 0 ; x < dimx ; x += 2){
     targx = 0;
-    for(int y = dimy - 1 ; y >= 0 ; --y){
+    for(int y = (int)dimy - 1 ; y >= 0 ; --y){
       if(rotate_2x1_cw(n, newp, y, x, targy, targx)){
         ncplane_destroy(newp);
         return -1;
@@ -567,15 +517,16 @@ int ncplane_rotate_ccw(ncplane* n){
   if(newp == NULL){
     return -1;
   }
-  int dimy, dimx, targdimy, targdimx;
+  unsigned dimy, dimx, targdimy, targdimx;
   ncplane_dim_yx(n, &dimy, &dimx);
   ncplane_dim_yx(newp, &targdimy, &targdimx);
-  int x = dimx - 2, y;
+  int x = (int)dimx - 2;
+  int y;
   // Each row of the target plane is taken from a column of the source plane.
   // As the target row grows (down), the source column shrinks (moves left).
-  for(int targy = 0 ; targy < targdimy ; ++targy){
+  for(unsigned targy = 0 ; targy < targdimy ; ++targy){
     y = 0;
-    for(int targx = 0 ; targx < targdimx ; targx += 2){
+    for(unsigned targx = 0 ; targx < targdimx ; targx += 2){
       if(rotate_2x1_ccw(n, newp, y, x, targy, targx)){
         ncplane_destroy(newp);
         return -1;
@@ -594,19 +545,20 @@ int ncplane_rotate_ccw(ncplane* n){
 #define QR_BASE_SIZE 17
 #define PER_QR_VERSION 4
 
-static inline int
-qrcode_rows(int version){
-  return QR_BASE_SIZE + (version * PER_QR_VERSION / 2);
-}
-
-static inline int
-qrcode_cols(int version){
+static inline unsigned
+qrcode_rows(unsigned version){
   return QR_BASE_SIZE + (version * PER_QR_VERSION);
 }
 
-int ncplane_qrcode(ncplane* n, int maxversion, const void* data, size_t len){
+static inline unsigned
+qrcode_cols(unsigned version){
+  return QR_BASE_SIZE + (version * PER_QR_VERSION);
+}
+
+int ncplane_qrcode(ncplane* n, unsigned* ymax, unsigned* xmax, const void* data, size_t len){
+  const ncblitter_e blitfxn = NCBLIT_2x1;
   const int MAX_QR_VERSION = 40; // QR library only supports up to 40
-  if(maxversion < 0){
+  if(*ymax <= 0 || *xmax <= 0){
     return -1;
   }
   if(len == 0){
@@ -614,25 +566,24 @@ int ncplane_qrcode(ncplane* n, int maxversion, const void* data, size_t len){
   }
   const int starty = n->y;
   const int startx = n->x;
-  const int availx = n->lenx - startx;
-  const int availy = n->leny - starty;
-  if(availy < qrcode_rows(1)){
+  if(*xmax > n->lenx - startx){
     return -1;
   }
-  if(availx < qrcode_cols(1)){
+  if(*ymax > n->leny - starty){
     return -1;
   }
-  const int availsquare = availy * 2 < availx ? availy * 2 : availx;
-  const int roomforver = (availsquare - QR_BASE_SIZE) / 4;
-  if(maxversion == 0){
-    maxversion = roomforver;
-  }else if(maxversion > roomforver){
-    maxversion = roomforver;
+  if(*ymax * 2 < qrcode_rows(1)){
+    return -1;
   }
-  if(maxversion > MAX_QR_VERSION){
-    maxversion = MAX_QR_VERSION;
+  if(*xmax < qrcode_cols(1)){
+    return -1;
   }
-  const size_t bsize = qrcodegen_BUFFER_LEN_FOR_VERSION(maxversion);
+  const int availsquare = *ymax * 2 < *xmax ? *ymax * 2 : *xmax;
+  int roomforver = (availsquare - QR_BASE_SIZE) / PER_QR_VERSION;
+  if(roomforver > MAX_QR_VERSION){
+    roomforver = MAX_QR_VERSION;
+  }
+  const size_t bsize = qrcodegen_BUFFER_LEN_FOR_VERSION(roomforver);
   if(bsize < len){
     return -1;
   }
@@ -643,40 +594,64 @@ int ncplane_qrcode(ncplane* n, int maxversion, const void* data, size_t len){
     free(dst);
     return -1;
   }
+  unsigned r, g, b;
+  // FIXME default might not be all-white
+  if(ncplane_fg_default_p(n)){
+    r = g = b = 0xff;
+  }else{
+    ncplane_fg_rgb8(n, &r, &g, &b);
+  }
   memcpy(src, data, len);
   int ret = -1;
-  if(qrcodegen_encodeBinary(src, len, dst, qrcodegen_Ecc_HIGH, 1, maxversion, qrcodegen_Mask_AUTO, true)){
-    ret = qrcodegen_getSize(dst);
-    for(int y = starty ; y < starty + (ret + 1) / 2 ; ++y){
-      for(int x = startx ; x < startx + ret ; ++x){
-        const bool top = qrcodegen_getModule(dst, x, y);
-        const bool bot = qrcodegen_getModule(dst, x, y + 1);
-        const char* egc;
-        if(top && bot){
-          egc = "█";
-        }else if(top){
-          egc = "▀";
-        }else if(bot){
-          egc = "▄";
-        }else{
-          egc = " ";
-        }
-        int sbytes;
-        if(ncplane_putegc_yx(n, y, x, egc, &sbytes) <= 0){
-          ret = -1;
-          break;
+  int yscale, xscale;
+  if(qrcodegen_encodeBinary(src, len, dst, qrcodegen_Ecc_HIGH, 1, roomforver, qrcodegen_Mask_AUTO, true)){
+    const int square = qrcodegen_getSize(dst);
+    uint32_t* rgba = malloc(square * square * sizeof(uint32_t));
+    if(rgba){
+      for(int y = starty ; y < starty + square ; ++y){
+        for(int x = startx ; x < startx + square ; ++x){
+          const bool pixel = qrcodegen_getModule(dst, x, y);
+          ncpixel_set_a(&rgba[y * square + x], 0xff);
+          ncpixel_set_rgb8(&rgba[y * square + x], r * pixel, g * pixel, b * pixel);
         }
       }
+      struct ncvisual* ncv = ncvisual_from_rgba(rgba, square, square * sizeof(uint32_t), square);
+      free(rgba);
+      if(ncv){
+        ret = square;
+        // we don't allow degredation because 2x1 is the only blitter which
+        // can generate a qrcode with proper aspect ratio. ascii is thus out.
+        struct ncvisual_options vopts = {
+          .n = n,
+          .blitter = blitfxn,
+          .flags = NCVISUAL_OPTION_NODEGRADE,
+        };
+        if(ncvisual_blit(ncplane_notcurses(n), ncv, &vopts) == n){
+          ret = square;
+        }
+        ncvgeom geom;
+        ncvisual_geom(ncplane_notcurses(n), NULL, &vopts, &geom);
+        yscale = geom.scaley;
+        xscale = geom.scalex;
+      }
+      ncvisual_destroy(ncv);
     }
   }
   free(src);
   free(dst);
-  return ret < 0 ? ret : (ret - QR_BASE_SIZE) / PER_QR_VERSION;
+  if(ret > 0){
+    ret = (ret - QR_BASE_SIZE) / PER_QR_VERSION;
+    *ymax = qrcode_rows(ret) / yscale;
+    *xmax = qrcode_cols(ret) / xscale;
+    return ret;
+  }
+  return -1;
 }
 #else
-int ncplane_qrcode(ncplane* n, int maxversion, const void* data, size_t len){
+int ncplane_qrcode(ncplane* n, unsigned* ymax, unsigned* xmax, const void* data, size_t len){
   (void)n;
-  (void)maxversion;
+  (void)ymax;
+  (void)xmax;
   (void)data;
   (void)len;
   return -1;

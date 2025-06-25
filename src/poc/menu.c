@@ -6,49 +6,51 @@
 
 static int
 run_menu(struct notcurses* nc, struct ncmenu* ncm){
-  struct ncplane* selplane = ncplane_aligned(notcurses_stdplane(nc), 3, 40, 10, NCALIGN_CENTER, NULL);
+  ncplane_options nopts = {
+    .y = 10,
+    .x = NCALIGN_CENTER,
+    .rows = 3,
+    .cols = 40,
+    .flags = NCPLANE_OPTION_HORALIGNED,
+  };
+  struct ncplane* selplane = ncplane_create(notcurses_stdplane(nc), &nopts);
   if(selplane == NULL){
     return -1;
   }
-  ncplane_set_fg(selplane, 0x0);
-  ncplane_set_bg(selplane, 0xdddddd);
+  ncplane_set_fg_rgb(selplane, 0x0);
+  ncplane_set_bg_rgb(selplane, 0xdddddd);
   uint64_t channels = 0;
-  channels_set_fg(&channels, 0x000088);
-  channels_set_bg(&channels, 0x88aa00);
+  ncchannels_set_fg_rgb(&channels, 0x000088);
+  ncchannels_set_bg_rgb(&channels, 0x88aa00);
   if(ncplane_set_base(selplane, " ", 0, channels) < 0){
     goto err;
   }
-  char32_t keypress;
+  uint32_t keypress;
   ncinput ni;
   notcurses_render(nc);
-  while((keypress = notcurses_getc_blocking(nc, &ni)) != (char32_t)-1){
+  while((keypress = notcurses_get_blocking(nc, &ni)) != (uint32_t)-1){
     if(!ncmenu_offer_input(ncm, &ni)){
-      if(keypress == '\x1b'){
-        if(ncmenu_rollup(ncm)){
-          goto err;
+      const char* sel;
+      if( (sel = ncmenu_mouse_selected(ncm, &ni, NULL)) ){
+        if(sel && !strcmp(sel, "Quit")){
+          ncmenu_destroy(ncm);
+          ncplane_destroy(selplane);
+          return 0;
         }
-      }else if(ni.alt){
-        switch(keypress){
-          case 'a': case 'A': case 0x00e4:
-            if(ncmenu_unroll(ncm, 0)){
-              goto err;
-            }
-            break;
-          case 'f': case 'F':
-            if(ncmenu_unroll(ncm, 1)){
-              goto err;
-            }
-            break;
-          case 'h': case 'H':
-            if(ncmenu_unroll(ncm, 3)){
-              goto err;
-            }
-            break;
-        }
+      }else if(ni.evtype == NCTYPE_RELEASE){
+        continue;
       }else if(keypress == 'q'){
         ncmenu_destroy(ncm);
         ncplane_destroy(selplane);
         return 0;
+      }else if(keypress == NCKEY_ENTER){ // selected a menu item
+        if( (sel = ncmenu_selected(ncm, &ni)) ){
+          if(strcmp(sel, "Quit") == 0){
+            ncmenu_destroy(ncm);
+            ncplane_destroy(selplane);
+            return 0;
+          }
+        }
       }
     }
     ncplane_erase(selplane);
@@ -66,65 +68,67 @@ err:
 }
 
 int main(void){
-  if(!setlocale(LC_ALL, "")){
-    return EXIT_FAILURE;
-  }
-  notcurses_options opts;
-  memset(&opts, 0, sizeof(opts));
-  struct notcurses* nc = notcurses_init(&opts, stdout);
+  notcurses_options opts = { };
+  struct notcurses* nc = notcurses_core_init(&opts, NULL);
   if(nc == NULL){
     return EXIT_FAILURE;
   }
-  notcurses_mouse_enable(nc);
+  notcurses_mice_enable(nc, NCMICE_BUTTON_EVENT);
   struct ncmenu_item demo_items[] = {
-    { .desc = "Restart", .shortcut = { .id = 'r', .ctrl = true, }, },
+    { .desc = "Restart", .shortcut = { .id = 'r', .modifiers = NCKEY_MOD_CTRL, }, },
+    { .desc = "Derp", .shortcut = { .id = 'd', }, },
   };
   struct ncmenu_item file_items[] = {
-    { .desc = "New", .shortcut = { .id = 'n', .ctrl = true, }, },
-    { .desc = "Open", .shortcut = { .id = 'o', .ctrl = true, }, },
-    { .desc = "Close", .shortcut = { .id = 'c', .ctrl = true, }, },
+    { .desc = "New", .shortcut = { .id = 'n', .modifiers = NCKEY_MOD_CTRL, }, },
+    { .desc = "Open", .shortcut = { .id = 'o', .modifiers = NCKEY_MOD_CTRL, }, },
+    { .desc = "Close", .shortcut = { .id = 'c', .modifiers = NCKEY_MOD_CTRL, }, },
     { .desc = NULL, },
-    { .desc = "Quit", .shortcut = { .id = 'q', .ctrl = true, }, },
+    { .desc = "Quit", .shortcut = { .id = 'q', }, },
   };
   struct ncmenu_item help_items[] = {
-    { .desc = "About", .shortcut = { .id = 'a', .ctrl = true, }, },
+    { .desc = "About", .shortcut = { .id = 'a', .modifiers = NCKEY_MOD_CTRL, }, },
   };
   struct ncmenu_section sections[] = {
     { .name = "Schwarzgerät", .items = demo_items,
       .itemcount = sizeof(demo_items) / sizeof(*demo_items),
-      .shortcut = { .id = 0x00e4, .alt = true, }, },
+      .shortcut = { .id = 0x00e4, .modifiers = NCKEY_MOD_ALT, }, },
     { .name = "File", .items = file_items,
       .itemcount = sizeof(file_items) / sizeof(*file_items),
-      .shortcut = { .id = 'f', .alt = true, }, },
+      .shortcut = { .id = 'f', .modifiers = NCKEY_MOD_ALT, }, },
     { .name = NULL, .items = NULL, .itemcount = 0, },
     { .name = "Help", .items = help_items,
       .itemcount = sizeof(help_items) / sizeof(*help_items),
-      .shortcut = { .id = 'h', .alt = true, }, },
+      .shortcut = { .id = 'h', .modifiers = NCKEY_MOD_ALT, }, },
   };
   ncmenu_options mopts;
   memset(&mopts, 0, sizeof(mopts));
   mopts.sections = sections;
   mopts.sectioncount = sizeof(sections) / sizeof(*sections);
-  channels_set_fg(&mopts.headerchannels, 0x00ff00);
-  channels_set_bg(&mopts.headerchannels, 0x440000);
-  channels_set_fg(&mopts.sectionchannels, 0xb0d700);
-  channels_set_bg(&mopts.sectionchannels, 0x002000);
-  struct ncmenu* top = ncmenu_create(nc, &mopts);
+  ncchannels_set_fg_rgb(&mopts.headerchannels, 0x00ff00);
+  ncchannels_set_bg_rgb(&mopts.headerchannels, 0x440000);
+  ncchannels_set_fg_rgb(&mopts.sectionchannels, 0xb0d700);
+  ncchannels_set_bg_rgb(&mopts.sectionchannels, 0x002000);
+  unsigned dimy, dimx;
+  struct ncplane* n = notcurses_stddim_yx(nc, &dimy, &dimx);
+  struct ncmenu* top = ncmenu_create(n, &mopts);
   if(top == NULL){
     goto err;
   }
-  int dimy, dimx;
-  struct ncplane* n = notcurses_stddim_yx(nc, &dimy, &dimx);
-
+  if(ncmenu_item_set_status(top, "Schwarzgerät", "Restart", false)){
+    goto err;
+  }
+  if(ncmenu_item_set_status(top, "File", "Open", false)){
+    goto err;
+  }
   uint64_t channels = 0;
-  channels_set_fg(&channels, 0x88aa00);
-  channels_set_bg(&channels, 0x000088);
+  ncchannels_set_fg_rgb(&channels, 0x88aa00);
+  ncchannels_set_bg_rgb(&channels, 0x000088);
   if(ncplane_set_base(n, "x", 0, channels) < 0){
     return EXIT_FAILURE;
   }
 
   notcurses_render(nc);
-  ncplane_set_fg(n, 0x00dddd);
+  ncplane_set_fg_rgb(n, 0x00dddd);
   if(ncplane_putstr_aligned(n, dimy - 1, NCALIGN_RIGHT, " -=+ menu poc. press q to exit +=- ") < 0){
 	  return EXIT_FAILURE;
   }
@@ -132,9 +136,15 @@ int main(void){
 
   ncplane_erase(n);
 
-  mopts.bottom = true;
-  struct ncmenu* bottom = ncmenu_create(nc, &mopts);
+  mopts.flags |= NCMENU_OPTION_BOTTOM;
+  struct ncmenu* bottom = ncmenu_create(n, &mopts);
   if(bottom == NULL){
+    goto err;
+  }
+  if(ncmenu_item_set_status(bottom, "Schwarzgerät", "Restart", false)){
+    goto err;
+  }
+  if(ncmenu_item_set_status(bottom, "Schwarzgerät", "Derp", false)){
     goto err;
   }
   if(ncplane_putstr_aligned(n, 0, NCALIGN_RIGHT, " -=+ menu poc. press q to exit +=- ") < 0){

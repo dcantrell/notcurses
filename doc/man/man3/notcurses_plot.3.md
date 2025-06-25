@@ -1,6 +1,6 @@
 % notcurses_plot(3)
 % nick black <nickblack@linux.com>
-% v1.3.3
+% v3.0.16
 
 # NAME
 
@@ -11,50 +11,58 @@ notcurses_plot - high level widget for plotting
 **#include <notcurses/notcurses.h>**
 
 ```c
-typedef enum {
-  NCPLOT_1x1,   // full block                █
-  NCPLOT_2x1,   // full/(upper|left) blocks  ▄█
-  NCPLOT_1x1x4, // shaded full blocks        ▓▒░█
-  NCPLOT_2x2,   // quadrants                 ▗▐ ▖▄▟▌▙█
-  NCPLOT_4x1,   // four vert/horz levels     █▆▄▂ / ▎▌▊█
-  NCPLOT_4x2,   // 4x2-way braille      ⡀⡄⡆⡇⢀⣀⣄⣆⣇⢠⣠⣤⣦⣧⢰⣰⣴⣶⣷⢸⣸⣼⣾⣿
-  NCPLOT_8x1,   // eight vert/horz levels    █▇▆▅▄▃▂▁ / ▏▎▍▌▋▊▉█
-} ncgridgeom_e;
+#define NCPLOT_OPTION_LABELTICKSD   0x0001u
+#define NCPLOT_OPTION_EXPONENTIALD  0x0002u
+#define NCPLOT_OPTION_VERTICALI     0x0004u
+#define NCPLOT_OPTION_NODEGRADE     0x0008u
+#define NCPLOT_OPTION_DETECTMAXONLY 0x0010u
+#define NCPLOT_OPTION_PRINTSAMPLE   0x0020u
 
 typedef struct ncplot_options {
   // channels for the maximum and minimum levels.
   // lerp across the domain between these two.
-  uint64_t maxchannel;
-  uint64_t minchannel;
-  // number of "pixels" per row x column
-  ncgridgeom_e gridtype;
-  // independent variable is a contiguous range
+  uint64_t maxchannels;
+  uint64_t minchannels;
+  // styling used for labels (NCPLOT_OPTION_LABELTICKSD)
+  uint16_t legendstyle;
+  // pass NCBLIT_DEFAULT maps to NCBLIT_8x1 (assuming
+  // UTF8) or NCBLIT_1x1 (in an ASCII environment)
+  ncblitter_e gridtype;
+  // independent variable can either be a contiguous range,
+  // or a finite set of keys. for a time range, say the
+  // previous hour sampled with second resolution, the
+  // independent variable would be the range [0..3600): 3600.
+  // if rangex is 0, it is dynamically set to the number
+  // of columns.
   int rangex;
-  bool labelaxisd;     // label dependent axis
-  bool exponentially;   // is dependent exponential?
-  bool vertical_indep; // vertical independent variable
+  const char* title;   // optional title
+  uint64_t flags;      // bitfield over NCPLOT_OPTION_*
 } ncplot_options;
 ```
 
-**struct ncuplot* ncuplot_create(struct ncplane* n, const ncplot_options* opts, uint64_t miny, uint64_t maxy);**
+**struct ncuplot* ncuplot_create(struct ncplane* ***n***, const ncplot_options* ***opts***, uint64_t ***miny***, uint64_t ***maxy***);**
 
-**struct ncdplot* ncdplot_create(struct ncplane* n, const ncplot_options* opts, double miny, double maxy);**
+**struct ncdplot* ncdplot_create(struct ncplane* ***n***, const ncplot_options* ***opts***, double ***miny***, double ***maxy***);**
 
-**struct ncplane* ncuplot_plane(struct ncuplot* n);**
+**struct ncplane* ncuplot_plane(struct ncuplot* ***n***);**
 
-**struct ncplane* ncdplot_plane(struct ncdplot* n);**
+**struct ncplane* ncdplot_plane(struct ncdplot* ***n***);**
 
-**int ncuplot_add_sample(struct ncuplot* n, uint64_t x, uint64_t y);**
+**int ncuplot_add_sample(struct ncuplot* ***n***, uint64_t ***x***, uint64_t ***y***);**
 
-**int ncdplot_add_sample(struct ncdplot* n, uint64_t x, double y);**
+**int ncdplot_add_sample(struct ncdplot* ***n***, uint64_t ***x***, double ***y***);**
 
-**int ncuplot_set_sample(struct ncuplot* n, uint64_t x, uint64_t y);**
+**int ncuplot_set_sample(struct ncuplot* ***n***, uint64_t ***x***, uint64_t ***y***);**
 
-**int ncdplot_set_sample(struct ncdplot* n, uint64_t x, double y);**
+**int ncdplot_set_sample(struct ncdplot* ***n***, uint64_t ***x***, double ***y***);**
 
-**void ncuplot_destroy(struct ncuplot* n);**
+**int ncuplot_sample(const struct ncuplot* ***n***, uint64_t ***x***, uint64_t* ***y***);**
 
-**void ncdplot_destroy(struct ncdplot* n);**
+**int ncdplot_sample(const struct ncdplot* ***n***, uint64_t ***x***, double* ***y***);**
+
+**void ncuplot_destroy(struct ncuplot* ***n***);**
+
+**void ncdplot_destroy(struct ncdplot* ***n***);**
 
 # DESCRIPTION
 
@@ -75,26 +83,33 @@ domain is specified, samples outside the domain are an error, and do not
 contribute to the plot. Supplying an **x** below the current window is an
 error, and has no effect.
 
-The different **ncgridgeom_e** values select from among available glyph sets:
-
-* **NCPLOT_1x1**: Full block (█) or empty glyph
-* **NCPLOT_2x1**: Adds the lower half block (▄) to **NCPLOT_1x1**.
-* **NCPLOT_1x1x4**: Adds three shaded full blocks (▓▒░) to **NCPLOT_1x1**.
-* **NCPLOT_2x2**: Adds left and right half blocks (▌▐) and quadrants (▖▗▟▙) to **NCPLOT_2x1**.
-* **NCPLOT_4x1**: Adds ¼ and ¾ blocks (▂▆) to **NCPLOT_2x1**.
-* **NCPLOT_4x2**: 4 rows and 2 columns of braille (⡀⡄⡆⡇⢀⣀⣄⣆⣇⢠⣠⣤⣦⣧⢰⣰⣴⣶⣷⢸⣸⣼⣾⣿).
-* **NCPLOT_8x1**: Adds ⅛, ⅜, ⅝, and ⅞ blocks (▇▅▃▁) to **NCPLOT_4x1**.
-
 More granular block glyphs means more resolution in your plots, but they can
-be difficult to differentiate at small text sizes. Quadrants and braille allow 
-for more resolution on the independent variable. It can be difficult to predict
-how the braille glyphs will look in a given font.
+be difficult to differentiate at small text sizes. Octants, sextants, and Braille
+allow for more resolution on the independent variable. It can be difficult to
+predict how the Braille glyphs will look in a given font.
 
-The same **ncplot_options** struct can be used with all ncplot types.
+The same **ncplot_options** struct can be used with all ncplot types. The
+**flags** field is a bitmask composed of:
+
+* **NCPLOT_OPTION_LABELTICKSD**: Label dependent axis ticks
+* **NCPLOT_OPTION_EXPONENTIALD**: Use an exponential dependent axis
+* **NCPLOT_OPTION_VERTICALI**: Vertical independent axis
+* **NCPLOT_OPTION_NODEGRADE**: Fail rather than degrade blitter
+* **NCPLOT_OPTION_DETECTMAXONLY**: Detect only max domain, not min
+* **NCPLOT_OPTION_PRINTSAMPLE**: Print the most recent sample
+
+If **NCPLOT_OPTION_LABELTICKSD** or **NCPLOT_OPTION_PRINTSAMPLE** is supplied,
+the **legendstyle** field will be used to style the labels. It is otherwise
+ignored.
+
+The **label** is printed in the upper left, immediately to the right of the
+topmost axis tick (if **NCPLOT_OPTION_LABELTICKSD** was used). The most
+recent sample is printed opposite from the label along the independent axis
+(if **NCPLOT_OPTION_PRINTSAMPLE** was used).
 
 # NOTES
 
-Neither **exponentially** not **vertical_indep** is yet implemented.
+**NCPLOT_OPTION_VERTICALI** is not yet implemented.
 
 # RETURN VALUES
 
@@ -107,4 +122,5 @@ non-zero. It will also return an error if **maxy** < **miny**. An invalid
 # SEE ALSO
 
 **notcurses(3)**,
-**notcurses_ncplane(3)**
+**notcurses_plane(3)**,
+**notcurses_visual(3)**

@@ -1,9 +1,8 @@
+#include "linux.h"
 #include "version.h"
 #include "egcpool.h"
 #include "internal.h"
-#include <ncurses.h> // needed for some definitions, see terminfo(3ncurses)
 #include <time.h>
-#include <term.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <stdio.h>
@@ -11,147 +10,177 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
-#include <signal.h>
-#include <langinfo.h>
-#include <sys/poll.h>
-#include <stdatomic.h>
-#include <sys/ioctl.h>
+#include <unistr.h>
+#include <locale.h>
+#include <uniwbrk.h>
+#include <inttypes.h>
+#include "compat/compat.h"
+#include "unixsig.h"
+#include "banner.h"
 
 #define ESC "\x1b"
+#define TABSTOP 8
 
-// only one notcurses object can be the target of signal handlers, due to their
-// process-wide nature.
-static notcurses* _Atomic signal_nc = ATOMIC_VAR_INIT(NULL); // ugh
-static void (*signal_sa_handler)(int); // stashed signal handler we replaced
+void notcurses_version_components(int* major, int* minor, int* patch, int* tweak){
+  *major = NOTCURSES_VERNUM_MAJOR;
+  *minor = NOTCURSES_VERNUM_MINOR;
+  *patch = NOTCURSES_VERNUM_PATCH;
+  *tweak = atoi(NOTCURSES_VERSION_TWEAK);
+}
 
-static int
-drop_signals(notcurses* nc){
-  notcurses* old = nc;
-  if(!atomic_compare_exchange_strong(&signal_nc, &old, NULL)){
-    fprintf(stderr, "Couldn't drop signals: %p != %p\n", old, nc);
+int notcurses_enter_alternate_screen(notcurses* nc){
+  if(nc->tcache.ttyfd < 0){
     return -1;
   }
+  if(enter_alternate_screen(nc->tcache.ttyfd, nc->ttyfp, &nc->tcache, nc->flags & NCOPTION_DRAIN_INPUT)){
+    return -1;
+  }
+  ncplane_set_scrolling(notcurses_stdplane(nc), false);
   return 0;
+}
+
+int notcurses_leave_alternate_screen(notcurses* nc){
+  if(nc->tcache.ttyfd < 0){
+    return -1;
+  }
+  if(leave_alternate_screen(nc->tcache.ttyfd, nc->ttyfp,
+                            &nc->tcache, nc->flags & NCOPTION_DRAIN_INPUT)){
+    return -1;
+  }
+  // move to the end of our output
+  if(nc->rstate.logendy < 0){
+    return 0;
+  }
+  ncplane_cursor_move_yx(notcurses_stdplane(nc), nc->rstate.logendy, nc->rstate.logendx);
+  return 0;
+}
+
+// reset the current colors, styles, and palette. called on startup (to purge
+// any preexisting styling) and shutdown (to not affect further programs).
+int reset_term_attributes(const tinfo* ti, fbuf* f){
+  int ret = 0;
+  const char* esc;
+  if((esc = get_escape(ti, ESCAPE_OP)) && fbuf_emit(f, esc)){
+    ret = -1;
+  }
+  if((esc = get_escape(ti, ESCAPE_SGR0)) && fbuf_emit(f, esc)){
+    ret = -1;
+  }
+  return ret;
+}
+
+// attempt to restore the palette. if XT{PUSH,POP}COLORS is supported, use
+// XTPOPCOLORS. if we can program individual colors, and we read the palette,
+// reload it from our initial capture. otherwise, use "oc" if available; this
+// will blow away any preexisting palette in favor of the default. if we've
+// never touched the palette, don't bother trying to restore it (unless we're
+// using XTPOPCOLORS, since in that case we always used XTPUSHCOLORS).
+int reset_term_palette(const tinfo* ti, fbuf* f, unsigned touchedpalette){
+  int ret = 0;
+  const char* esc;
+  if((esc = get_escape(ti, ESCAPE_RESTORECOLORS))){
+    loginfo("restoring palette via xtpopcolors");
+    if(fbuf_emit(f, esc)){
+      ret = -1;
+    }
+    return ret;
+  }
+  if(!touchedpalette){
+    return 0;
+  }
+  if(ti->caps.can_change_colors && ti->maxpaletteread > -1){
+    loginfo("restoring saved palette (%d)", ti->maxpaletteread + 1);
+    esc = get_escape(ti, ESCAPE_INITC);
+    for(int z = 0 ; z < ti->maxpaletteread ; ++z){
+      unsigned r, g, b;
+      ncchannel_rgb8(ti->originalpalette.chans[z], &r, &g, &b);
+      // Need convert RGB values [0..256) to [0..1000], ugh
+      r = r * 1000 / 255;
+      g = g * 1000 / 255;
+      b = b * 1000 / 255;
+      if(fbuf_emit(f, tiparm(esc, z, r, g, b)) < 0){
+        return -1;
+      }
+    }
+  }else if((esc = get_escape(ti, ESCAPE_OC))){
+    loginfo("resetting palette");
+    if(fbuf_emit(f, esc)){
+      ret = -1;
+    }
+  }else{
+    logwarn("no method known to restore palette");
+  }
+  return ret;
 }
 
 // Do the minimum necessary stuff to restore the terminal, then return. This is
 // the end of the line for fatal signal handlers. notcurses_stop() will go on
-// to tear down and account for internal structures.
+// to tear down and account for internal structures. note that we do lots of
+// shit here that is unsafe within a signal handler =[ FIXME.
 static int
-notcurses_stop_minimal(notcurses* nc){
+notcurses_stop_minimal(void* vnc, void** altstack, int errret){
+  notcurses* nc = vnc;
   int ret = 0;
-  drop_signals(nc);
-  if(nc->rmcup && term_emit("rmcup", nc->rmcup, nc->ttyfp, true)){
+  ret |= drop_signals(nc, altstack);
+  // collect output into the memstream buffer, and then dump it directly using
+  // blocking_write(), to avoid problems with unreliable fflush().
+  fbuf* f = &nc->rstate.f;
+  fbuf_reset(f);
+  // be sure to write the restoration sequences *prior* to running rmcup, as
+  // they apply to the screen (alternate or otherwise) we're actually using.
+  const char* esc;
+  ret |= reset_term_palette(&nc->tcache, f, nc->touched_palette);
+  ret |= reset_term_attributes(&nc->tcache, f);
+  if((esc = get_escape(&nc->tcache, ESCAPE_RMKX)) && fbuf_emit(f, esc)){
     ret = -1;
   }
-  if(nc->cnorm && term_emit("cnorm", nc->cnorm, nc->ttyfp, true)){
+  const char* cnorm = get_escape(&nc->tcache, ESCAPE_CNORM);
+  if(cnorm && fbuf_emit(f, cnorm)){
     ret = -1;
   }
-  if(nc->op && term_emit("op", nc->op, nc->ttyfp, true)){
+  if(fbuf_flush(f, nc->ttyfp)){
     ret = -1;
   }
-  if(nc->sgr0 && term_emit("sgr0", nc->sgr0, nc->ttyfp, true)){
-    ret = -1;
+  if(nc->tcache.ttyfd >= 0){
+    ret |= notcurses_mice_disable(nc);
+    if(nc->tcache.tpreserved){
+      ret |= tcsetattr(nc->tcache.ttyfd, TCSAFLUSH, nc->tcache.tpreserved);
+    }
+    // don't use leave_alternate_screen() here; we need pop the keyboard
+    // whether we're in regular or alternate screen, and we need it done
+    // before returning to the regular screen if we're in the alternate. if
+    // we drained input, we never sent a keyboard modifier; send none now.
+    if(!(nc->flags & NCOPTION_DRAIN_INPUT)){
+      if(nc->tcache.kbdlevel){
+        if(tty_emit(KKEYBOARD_POP, nc->tcache.ttyfd)){
+          ret = -1;
+        }
+      }else{
+        if(tty_emit(XTMODKEYSUNDO, nc->tcache.ttyfd)){
+          ret = -1;
+        }
+      }
+    }
+    if(nc->tcache.in_alt_screen){
+      if((esc = get_escape(&nc->tcache, ESCAPE_RMCUP))){
+        if(tty_emit(esc, nc->tcache.ttyfd)){
+          ret = -1;
+        }
+        nc->tcache.in_alt_screen = 0;
+      }
+    }
   }
-  if(nc->oc && term_emit("oc", nc->oc, nc->ttyfp, true)){
-    ret = -1;
+  if(errret){
+    ret = errret;
   }
-  ret |= notcurses_mouse_disable(nc);
-  ret |= tcsetattr(nc->ttyfd, TCSANOW, &nc->tpreserved);
+  logdebug("restored terminal, returning %d", ret);
   return ret;
 }
 
-// this wildly unsafe handler will attempt to restore the screen upon
-// reception of SIG{INT, SEGV, ABRT, QUIT}. godspeed you, black emperor!
-static void
-fatal_handler(int signo){
-  notcurses* nc = atomic_load(&signal_nc);
-  if(nc){
-    notcurses_stop_minimal(nc);
-    if(signal_sa_handler){
-      signal_sa_handler(signo);
-    }
-    raise(signo);
-  }
-}
-
-static int
-setup_signals(notcurses* nc, bool no_quit_sigs, bool no_winch_sig){
-  notcurses* expected = NULL;
-  struct sigaction oldact;
-  struct sigaction sa;
-
-  if(!atomic_compare_exchange_strong(&signal_nc, &expected, nc)){
-    fprintf(stderr, "%p is already registered for signals\n", expected);
-    return -1;
-  }
-  if(!no_winch_sig){
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = sigwinch_handler;
-    if(sigaction(SIGWINCH, &sa, NULL)){
-      atomic_store(&signal_nc, NULL);
-      fprintf(stderr, "Error installing SIGWINCH handler (%s)\n",
-              strerror(errno));
-      return -1;
-    }
-  }
-  if(!no_quit_sigs){
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = fatal_handler;
-    sigaddset(&sa.sa_mask, SIGINT);
-    sigaddset(&sa.sa_mask, SIGQUIT);
-    sigaddset(&sa.sa_mask, SIGSEGV);
-    sigaddset(&sa.sa_mask, SIGABRT);
-    sa.sa_flags = SA_RESETHAND; // don't try twice
-    int ret = 0;
-    ret |= sigaction(SIGINT, &sa, &oldact);
-    ret |= sigaction(SIGQUIT, &sa, &oldact);
-    ret |= sigaction(SIGSEGV, &sa, &oldact);
-    ret |= sigaction(SIGABRT, &sa, &oldact);
-    if(ret){
-      atomic_store(&signal_nc, NULL);
-      fprintf(stderr, "Error installing fatal signal handlers (%s)\n",
-              strerror(errno));
-      return -1;
-    }
-    signal_sa_handler = oldact.sa_handler;
-  }
-  return 0;
-}
-
-// make a heap-allocated wchar_t expansion of the multibyte string at s
-wchar_t* wchar_from_utf8(const char* s){
-  mbstate_t ps;
-  memset(&ps, 0, sizeof(ps));
-  // worst case is a wchar_t for every byte of input (all-ASCII case)
-  const size_t maxw = strlen(s) + 1;
-  wchar_t* dst = malloc(sizeof(*dst) * maxw);
-  size_t wcount = mbsrtowcs(dst, &s, maxw, &ps);
-  if(wcount == (size_t)-1){
-    free(dst);
-    return NULL;
-  }
-  if(s){
-    free(dst);
-    return NULL;
-  }
-  return dst;
-}
-
-int ncplane_putstr_aligned(ncplane* n, int y, ncalign_e align, const char* s){
-  wchar_t* w = wchar_from_utf8(s);
-  if(w == NULL){
-    return -1;
-  }
-  int r = ncplane_putwstr_aligned(n, y, align, w);
-  free(w);
-  return r;
-}
-
 static const char NOTCURSES_VERSION[] =
- notcurses_VERSION_MAJOR "."
- notcurses_VERSION_MINOR "."
- notcurses_VERSION_PATCH;
+ NOTCURSES_VERSION_MAJOR "."
+ NOTCURSES_VERSION_MINOR "."
+ NOTCURSES_VERSION_PATCH;
 
 const char* notcurses_version(void){
   return NOTCURSES_VERSION;
@@ -178,34 +207,101 @@ cursor_invalid_p(const ncplane* n){
   if(n->y >= n->leny || n->x >= n->lenx){
     return true;
   }
-  if(n->y < 0 || n->x < 0){
-    return true;
-  }
   return false;
 }
 
-char* ncplane_at_cursor(ncplane* n, uint32_t* attrword, uint64_t* channels){
-  if(cursor_invalid_p(n)){
-    return NULL;
-  }
-  return cell_extract(n, &n->fb[nfbcellidx(n, n->y, n->x)], attrword, channels);
+char* ncplane_at_cursor(const ncplane* n, uint16_t* stylemask, uint64_t* channels){
+  return ncplane_at_yx(n, n->y, n->x, stylemask, channels);
 }
 
-char* ncplane_at_yx(ncplane* n, int y, int x, uint32_t* attrword, uint64_t* channels){
-  char* ret = NULL;
-  if(y < n->leny && x < n->lenx){
-    if(y >= 0 && x >= 0){
-      ret = cell_extract(n, &n->fb[nfbcellidx(n, y, x)], attrword, channels);
+char* ncplane_at_yx(const ncplane* n, int y, int x, uint16_t* stylemask, uint64_t* channels){
+  if(y < 0){
+    if(y != -1){
+      logerror("invalid y: %d", y);
+      return NULL;
+    }
+    y = n->y;
+  }
+  if(x < 0){
+    if(x != -1){
+      logerror("invalid x: %d", x);
+      return NULL;
+    }
+    x = n->x;
+  }
+  if((unsigned)y >= n->leny || (unsigned)x >= n->lenx){
+    logerror("invalid coordinates: %d/%d", y, x);
+    return NULL;
+  }
+  if(n->sprite){
+    if(stylemask){
+      *stylemask = 0;
+    }
+    if(channels){
+      *channels = 0;
+    }
+    return strdup(n->sprite->glyph.buf);
+  }
+  const nccell* yx = &n->fb[nfbcellidx(n, y, x)];
+  // if we're the right side of a wide glyph, we return the main glyph
+  if(nccell_wide_right_p(yx)){
+    return ncplane_at_yx(n, y, x - 1, stylemask, channels);
+  }
+  char* ret = nccell_extract(n, yx, stylemask, channels);
+  if(ret == NULL){
+    return NULL;
+  }
+//fprintf(stderr, "GOT [%s]\n", ret);
+  if(strcmp(ret, "") == 0){
+    free(ret);
+    ret = nccell_strdup(n, &n->basecell);
+    if(ret == NULL){
+      return NULL;
+    }
+    if(stylemask){
+      *stylemask = n->basecell.stylemask;
     }
   }
+  // FIXME load basecell channels if appropriate
   return ret;
 }
 
-cell* ncplane_cell_ref_yx(ncplane* n, int y, int x){
-  return &n->fb[nfbcellidx(n, y, x)];
+int ncplane_at_cursor_cell(ncplane* n, nccell* c){
+  return ncplane_at_yx_cell(n, n->y, n->x, c);
 }
 
-void ncplane_dim_yx(const ncplane* n, int* rows, int* cols){
+int ncplane_at_yx_cell(ncplane* n, int y, int x, nccell* c){
+  if(n->sprite){
+    logerror("invoked on a sprixel plane");
+    return -1;
+  }
+  if(y < 0){
+    if(y != -1){
+      logerror("invalid y: %d", y);
+      return -1;
+    }
+    y = n->y;
+  }
+  if(x < 0){
+    if(x != -1){
+      logerror("invalid x: %d", x);
+      return -1;
+    }
+    x = n->x;
+  }
+  if((unsigned)y >= n->leny || (unsigned)x >= n->lenx){
+    logerror("invalid coordinates: %d/%d", y, x);
+    return -1;
+  }
+  nccell* targ = ncplane_cell_ref_yx(n, y, x);
+  if(nccell_duplicate(n, c, targ)){
+    return -1;
+  }
+  // FIXME take base cell into account where necessary!
+  return strlen(nccell_extended_gcluster(n, targ));
+}
+
+void ncplane_dim_yx(const ncplane* n, unsigned* rows, unsigned* cols){
   if(rows){
     *rows = n->leny;
   }
@@ -215,99 +311,375 @@ void ncplane_dim_yx(const ncplane* n, int* rows, int* cols){
 }
 
 // anyone calling this needs ensure the ncplane's framebuffer is updated
-// to reflect changes in geometry.
-int update_term_dimensions(int fd, int* rows, int* cols){
+// to reflect changes in geometry. also called at startup for standard plane.
+// sets |cgeo_changed| high iff the cell geometry changed (will happen on a
+//  resize, and on a font resize if the pixel geometry does not change).
+// sets |pgeo_changed| high iff the cell-pixel geometry changed (will happen
+//  on a font resize).
+int update_term_dimensions(unsigned* rows, unsigned* cols, tinfo* tcache,
+                           int margin_b, unsigned* cgeo_changed, unsigned* pgeo_changed){
+  *pgeo_changed = 0;
+  *cgeo_changed = 0;
+  // if we're not a real tty, we presumably haven't changed geometry, return
+  if(tcache->ttyfd < 0){
+    if(rows){
+      *rows = tcache->default_rows;
+    }
+    if(cols){
+      *cols = tcache->default_cols;
+    }
+    tcache->cellpxy = 0;
+    tcache->cellpxx = 0;
+    return 0;
+  }
+  unsigned rowsafe, colsafe;
+  if(rows == NULL){
+    rows = &rowsafe;
+    rowsafe = tcache->dimy;
+  }
+  if(cols == NULL){
+    cols = &colsafe;
+    colsafe = tcache->dimx;
+  }
+#ifndef __MINGW32__
   struct winsize ws;
-  int i = ioctl(fd, TIOCGWINSZ, &ws);
-  if(i < 0){
-    fprintf(stderr, "TIOCGWINSZ failed on %d (%s)\n", fd, strerror(errno));
+  if(tiocgwinsz(tcache->ttyfd, &ws)){
     return -1;
   }
-  if(ws.ws_row <= 0 || ws.ws_col <= 0){
-    fprintf(stderr, "Bogus return from TIOCGWINSZ on %d (%d/%d)\n",
-            fd, ws.ws_row, ws.ws_col);
-    return -1;
+  *rows = ws.ws_row;
+  *cols = ws.ws_col;
+  unsigned cpixy;
+  unsigned cpixx;
+#ifdef __linux__
+  if(tcache->linux_fb_fd >= 0){
+    get_linux_fb_pixelgeom(tcache, &tcache->pixy, &tcache->pixx);
+    cpixy = tcache->pixy / *rows;
+    cpixx = tcache->pixx / *cols;
+  }else{
+#else
+  {
+#endif
+    // we might have the pixel geometry from CSI14t, so don't override a valid
+    // earlier response with 0s from the ioctl. we do want to fire off a fresh
+    // CSI14t in this case, though FIXME.
+    if(ws.ws_ypixel){
+      tcache->pixy = ws.ws_ypixel;
+      tcache->pixx = ws.ws_xpixel;
+    }
+    // update even if we didn't get values just now, because we need set
+    // cellpx{y,x} up from an initial CSI14n, which set only pix{y,x}.
+    cpixy = ws.ws_row ? tcache->pixy / ws.ws_row : 0;
+    cpixx = ws.ws_col ? tcache->pixx / ws.ws_col : 0;
   }
-  if(rows){
-    *rows = ws.ws_row;
+  if(tcache->cellpxy != cpixy){
+    tcache->cellpxy = cpixy;
+    *pgeo_changed = 1;
   }
-  if(cols){
-    *cols = ws.ws_col;
+  if(tcache->cellpxx != cpixx){
+    tcache->cellpxx = cpixx;
+    *pgeo_changed = 1;
+  }
+  if(tcache->cellpxy == 0 || tcache->cellpxx == 0){
+    tcache->pixel_draw = NULL; // disable support
+  }
+#else
+  CONSOLE_SCREEN_BUFFER_INFO csbi;
+  // There is the buffer itself, which is similar in function to the scrollback
+  // buffer in a Linux terminal, and there is the display window, which is the
+  // visible view of that buffer. The addressable area (from a VT point of
+  // view) spans the width of the buffer, but the height of the display window.
+  //
+  //  +--------------------------+      ^
+  //  |                          |      |
+  //  |                          |      |
+  //  +-----+--------------+-----+ ^ w  | b
+  //  |XXXXX|XXXXXXXXXXXXXX|XXXXX| | i  | u
+  //  |XXXXX|XXXXXXXXXXXXXX|XXXXX| | n  | f
+  //  |XXXXX|XXXXXXXXXXXXXX|XXXXX| | d  | f
+  //  |XXXXX|XXXXXXXXXXXXXX|XXXXX| | o  | e
+  //  +-----+--------------+-----+ v w  | r
+  //  |                          |      |
+  //  |                          |      |
+  //  +--------------------------+      v
+  //
+  //      <--- window --->
+  //
+  //<--------- buffer --------->
+  //
+  // Because the buffer extends past the bottom of the display window, a user
+  // can potentially scroll down beyond what would normally be thought of as the
+  // end of the buffer. Because the buffer can be wider than the display
+  // window, the user can scroll horizontally to view parts of the addressable
+  // area that aren't currently visible.
+  if(GetConsoleScreenBufferInfo(tcache->outhandle, &csbi)){
+    *cols = csbi.dwSize.X;
+    *rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+  }else{
+    *rows = tcache->default_rows;
+    *cols = tcache->default_cols;
+  }
+#endif
+  if(tcache->dimy != *rows){
+    tcache->dimy = *rows;
+    *cgeo_changed = 1;
+  }
+  if(tcache->dimx != *cols){
+    tcache->dimx = *cols;
+    *cgeo_changed = 1;
+  }
+  if(tcache->sixel_maxy_pristine){
+    int sixelrows = *rows - 1;
+    // if the bottom margin is at least one row, we can draw into the last
+    // row of our visible area. we must leave the true bottom row alone.
+    if(margin_b){
+      ++sixelrows;
+    }
+    tcache->sixel_maxy = sixelrows * tcache->cellpxy;
+    if(tcache->sixel_maxy > tcache->sixel_maxy_pristine){
+      tcache->sixel_maxy = tcache->sixel_maxy_pristine;
+    }
   }
   return 0;
 }
 
-static int
-term_verify_seq(char** gseq, const char* name){
-  char* seq;
-  if(gseq == NULL){
-    gseq = &seq;
-  }
-  *gseq = tigetstr(name);
-  if(*gseq == NULL || *gseq == (char*)-1){
-    return -1;
-  }
-  return 0;
-}
-
+// destroy the sprixels of an ncpile (this will not hide the sprixels)
 static void
-free_plane(ncplane* p){
+free_sprixels(ncpile* n){
+  while(n->sprixelcache){
+    sprixel* tmp = n->sprixelcache->next;
+    sprixel_free(n->sprixelcache);
+    n->sprixelcache = tmp;
+  }
+}
+
+// destroy an empty ncpile. only call with pilelock held.
+static void
+ncpile_destroy(ncpile* pile){
+  if(pile){
+    pile->prev->next = pile->next;
+    pile->next->prev = pile->prev;
+    free_sprixels(pile);
+    free(pile->crender);
+    free(pile);
+  }
+}
+
+void free_plane(ncplane* p){
   if(p){
-    --p->nc->stats.planes;
-    p->nc->stats.fbbytes -= sizeof(*p->fb) * p->leny * p->lenx;
+    // ncdirect fakes an ncplane with no ->pile
+    if(ncplane_pile(p)){
+      notcurses* nc = ncplane_notcurses(p);
+      pthread_mutex_lock(&nc->stats.lock);
+        --ncplane_notcurses(p)->stats.s.planes;
+        ncplane_notcurses(p)->stats.s.fbbytes -= sizeof(*p->fb) * p->leny * p->lenx;
+      pthread_mutex_unlock(&nc->stats.lock);
+      if(p->above == NULL && p->below == NULL){
+        pthread_mutex_lock(&nc->pilelock);
+          ncpile_destroy(ncplane_pile(p));
+        pthread_mutex_unlock(&nc->pilelock);
+      }
+    }
+    if(p->widget){
+      void* w = p->widget;
+      void (*wdestruct)(void*) = p->wdestruct;
+      p->widget = NULL;
+      p->wdestruct = NULL;
+      logdebug("calling widget destructor %p(%p)", wdestruct, w);
+      wdestruct(w);
+      logdebug("got the widget");
+    }
+    if(p->sprite){
+      sprixel_hide(p->sprite);
+    }
+    destroy_tam(p);
     egcpool_dump(&p->pool);
+    free(p->name);
     free(p->fb);
     free(p);
   }
+}
+
+// create a new ncpile. only call with pilelock held. the return value
+// was assigned to n->pile.
+__attribute__((malloc))
+static ncpile*
+make_ncpile(notcurses* nc, ncplane* n){
+  ncpile* ret = malloc(sizeof(*ret));
+  if(ret){
+    ret->nc = nc;
+    ret->top = n;
+    ret->bottom = n;
+    ret->roots = n;
+    n->bprev = &ret->roots;
+    if(nc->stdplane){ // stdplane (and thus stdpile) has already been created
+      ret->prev = ncplane_pile(nc->stdplane)->prev;
+      ncplane_pile(nc->stdplane)->prev->next = ret;
+      ret->next = ncplane_pile(nc->stdplane);
+      ncplane_pile(nc->stdplane)->prev = ret;
+    }else{
+      ret->prev = ret;
+      ret->next = ret;
+    }
+    n->above = NULL;
+    n->below = NULL;
+    ret->dimy = nc->tcache.dimy;
+    ret->dimx = nc->tcache.dimx;
+    ret->cellpxy = nc->tcache.cellpxy;
+    ret->cellpxx = nc->tcache.cellpxx;
+    ret->crender = NULL;
+    ret->crenderlen = 0;
+    ret->sprixelcache = NULL;
+    ret->scrolls = 0;
+  }
+  n->pile = ret;
+  return ret;
+}
+
+
+static inline size_t  ncplane_sizeof_cellarray( size_t rows, size_t cols)
+{
+  // check if multiplication would overflow
+  // calloc will deal with overflow due to sizeof(nccell)
+  if( ! rows || (cols > SIZE_MAX / rows)) 
+    return 0;
+  return rows * cols;
 }
 
 // create a new ncplane at the specified location (relative to the true screen,
 // having origin at 0,0), having the specified size, and put it at the top of
 // the planestack. its cursor starts at its origin; its style starts as null.
 // a plane may exceed the boundaries of the screen, but must have positive
-// size in both dimensions. bind the plane to 'n', which may be NULL. if bound
-// to a plane, this plane moves when that plane moves, and move targets are
-// relative to that plane.
-static ncplane*
-ncplane_create(notcurses* nc, ncplane* n, int rows, int cols,
-               int yoff, int xoff, void* opaque){
-  if(rows <= 0 || cols <= 0){
-    return NULL;
+// size in both dimensions. bind the plane to 'n', which may be NULL to create
+// a new pile. if bound to a plane instead, this plane moves when that plane
+// moves, and coordinates to move to are relative to that plane.
+// there are two denormalized case we also must handle, that of the "fake"
+// isolated ncplane created by ncdirect for rendering visuals. in that case
+// (and only in that case), nc is NULL (as is n). there's also creation of the
+// initial standard plane, in which case nc is not NULL, but nc->stdplane *is*
+// (as once more is n).
+ncplane* ncplane_new_internal(notcurses* nc, ncplane* n,
+                              const ncplane_options* nopts){
+  if(nopts->flags >= (NCPLANE_OPTION_FIXED << 1u)){
+    logwarn("provided unsupported flags %016" PRIx64, nopts->flags);
+  }
+  if(nopts->flags & NCPLANE_OPTION_HORALIGNED || nopts->flags & NCPLANE_OPTION_VERALIGNED){
+    if(n == NULL){
+      logerror("alignment requires a parent plane");
+      return NULL;
+    }
+  }
+  if(nopts->flags & NCPLANE_OPTION_MARGINALIZED){
+    if(nopts->rows != 0 || nopts->cols != 0){
+      logerror("geometry specified with margins (r=%u, c=%u)",
+               nopts->rows, nopts->cols);
+      return NULL;
+    }
   }
   ncplane* p = malloc(sizeof(*p));
-  size_t fbsize = sizeof(*p->fb) * (rows * cols);
-  if((p->fb = malloc(fbsize)) == NULL){
+  if(p == NULL){
+    return NULL;
+  }
+  p->scrolling = nopts->flags & NCPLANE_OPTION_VSCROLL;
+  p->fixedbound = nopts->flags & NCPLANE_OPTION_FIXED;
+  p->autogrow = nopts->flags & NCPLANE_OPTION_AUTOGROW;
+  p->widget = NULL;
+  p->wdestruct = NULL;
+  if(nopts->flags & NCPLANE_OPTION_MARGINALIZED){
+    p->margin_b = nopts->margin_b;
+    p->margin_r = nopts->margin_r;
+    if(n){ // use parent size
+      p->leny = ncplane_dim_y(n);
+      p->lenx = ncplane_dim_x(n);
+    }else{ // use pile size
+      notcurses_term_dim_yx(nc, &p->leny, &p->lenx);
+    }
+    if((p->leny -= p->margin_b) <= 0){
+      p->leny = 1;
+    }
+    if((p->lenx -= p->margin_r) <= 0){
+      p->lenx = 1;
+    }
+  }else{
+    p->leny = nopts->rows;
+    p->lenx = nopts->cols;
+  }
+
+  size_t fbsize = ncplane_sizeof_cellarray(p->leny, p->lenx);
+  if(!fbsize || (p->fb = calloc(fbsize, sizeof(struct nccell))) == NULL){
+    logerror("error allocating cellmatrix (r=%u, c=%u)",
+             p->leny, p->lenx);
     free(p);
     return NULL;
   }
-  memset(p->fb, 0, fbsize);
-  p->scrolling = false;
-  p->userptr = NULL;
-  p->leny = rows;
-  p->lenx = cols;
   p->x = p->y = 0;
   p->logrow = 0;
-  if( (p->bound = n) ){
-    p->absx = xoff + n->absx;
-    p->absy = yoff + n->absy;
-    p->bnext = n->blist;
-    n->blist = p;
-  }else{
-    p->absx = xoff + nc->margin_l;
-    p->absy = yoff + nc->margin_t;
+  p->sprite = NULL;
+  p->blist = NULL;
+  p->name = strdup(nopts->name ? nopts->name : "");
+  p->halign = NCALIGN_UNALIGNED;
+  p->valign = NCALIGN_UNALIGNED;
+  p->tam = NULL;
+  if(!n){ // new root/standard plane
+    p->absy = nopts->y;
+    p->absx = nopts->x;
     p->bnext = NULL;
+    p->bprev = NULL;
+    p->boundto = p;
+  }else{ // bound to preexisting pile
+    if(nopts->flags & NCPLANE_OPTION_HORALIGNED){
+      p->absx = ncplane_halign(n, nopts->x, nopts->cols);
+      p->halign = nopts->x;
+    }else{
+      p->absx = nopts->x;
+    }
+    p->absx += n->absx;
+    if(nopts->flags & NCPLANE_OPTION_VERALIGNED){
+      p->absy = ncplane_valign(n, nopts->y, nopts->rows);
+      p->valign = nopts->y;
+    }else{
+      p->absy = nopts->y;
+    }
+    p->absy += n->absy;
+    if( (p->bnext = n->blist) ){
+      n->blist->bprev = &p->bnext;
+    }
+    p->bprev = &n->blist;
+    *p->bprev = p;
+    p->boundto = n;
   }
-  p->attrword = 0;
+  // FIXME handle top/left margins
+  p->resizecb = nopts->resizecb;
+  p->stylemask = 0;
   p->channels = 0;
   egcpool_init(&p->pool);
-  cell_init(&p->basecell);
-  p->blist = NULL;
-  p->userptr = opaque;
-  p->z = nc->top;
-  nc->top = p;
-  p->nc = nc;
-  nc->stats.fbbytes += fbsize;
-  ++nc->stats.planes;
+  nccell_init(&p->basecell);
+  p->userptr = nopts->userptr;
+  if(nc == NULL){ // fake ncplane backing ncdirect object
+    p->above = NULL;
+    p->below = NULL;
+    p->pile = NULL;
+  }else{
+    pthread_mutex_lock(&nc->pilelock);
+      ncpile* pile = n ? ncplane_pile(n) : NULL;
+      if( (p->pile = pile) ){ // existing pile
+        p->above = NULL;
+        if( (p->below = pile->top) ){ // always happens save initial plane
+          pile->top->above = p;
+        }else{
+          pile->bottom = p;
+        }
+        pile->top = p;
+      }else{ // new pile
+        make_ncpile(nc, p);
+      }
+      pthread_mutex_lock(&nc->stats.lock);
+        nc->stats.s.fbbytes += fbsize;
+        ++nc->stats.s.planes;
+      pthread_mutex_unlock(&nc->stats.lock);
+    pthread_mutex_unlock(&nc->pilelock);
+  }
+  loginfo("created new %ux%u plane \"%s\" @ %dx%d",
+          p->leny, p->lenx, p->name ? p->name : "", p->absy, p->absx);
   return p;
 }
 
@@ -315,113 +687,250 @@ ncplane_create(notcurses* nc, ncplane* n, int rows, int cols,
 // the z-buffer. clear out all cells. this is for a wholly new context.
 static ncplane*
 create_initial_ncplane(notcurses* nc, int dimy, int dimx){
-  nc->stdscr = ncplane_create(nc, NULL, dimy - (nc->margin_t + nc->margin_b),
-                              dimx - (nc->margin_l + nc->margin_r), 0, 0, NULL);
-  return nc->stdscr;
+  ncplane_options nopts = {
+    .y = 0, .x = 0,
+    .rows = dimy - (nc->margin_t + nc->margin_b),
+    .cols = dimx - (nc->margin_l + nc->margin_r),
+    .userptr = NULL,
+    .name = "std",
+    .resizecb = NULL,
+    .flags = 0,
+  };
+  return nc->stdplane = ncplane_new_internal(nc, NULL, &nopts);
 }
 
 ncplane* notcurses_stdplane(notcurses* nc){
-  return nc->stdscr;
+  return nc->stdplane;
 }
 
 const ncplane* notcurses_stdplane_const(const notcurses* nc){
-  return nc->stdscr;
+  return nc->stdplane;
 }
 
-ncplane* ncplane_new(notcurses* nc, int rows, int cols, int yoff, int xoff, void* opaque){
-  return ncplane_create(nc, NULL, rows, cols, yoff, xoff, opaque);
+ncplane* ncplane_create(ncplane* n, const ncplane_options* nopts){
+  return ncplane_new_internal(ncplane_notcurses(n), n, nopts);
 }
 
-ncplane* ncplane_bound(ncplane* n, int rows, int cols, int yoff, int xoff, void* opaque){
-  return ncplane_create(n->nc, n, rows, cols, yoff, xoff, opaque);
+ncplane* ncpile_create(notcurses* nc, const struct ncplane_options* nopts){
+  return ncplane_new_internal(nc, NULL, nopts);
 }
 
-ncplane* ncplane_aligned(ncplane* n, int rows, int cols, int yoff,
-                         ncalign_e align, void* opaque){
-  return ncplane_create(n->nc, NULL, rows, cols, yoff, ncplane_align(n, align, cols), opaque);
+void ncplane_home(ncplane* n){
+  n->x = 0;
+  n->y = 0;
 }
 
-inline int ncplane_cursor_move_yx(ncplane* n, int y, int x){
-  if(x >= n->lenx){
-    return -1;
-  }else if(x < 0){
+int ncplane_cursor_move_yx(ncplane* n, int y, int x){
+  if(x < 0){
     if(x < -1){
+      logerror("negative target x %d", x);
       return -1;
     }
+  }else if((unsigned)x >= n->lenx){
+    logerror("target x %d >= width %u", x, n->lenx);
+    return -1;
   }else{
     n->x = x;
   }
-  if(y >= n->leny){
-    return -1;
-  }else if(y < 0){
+  if(y < 0){
     if(y < -1){
+      logerror("negative target y %d", y);
       return -1;
     }
+  }else if((unsigned)y >= n->leny){
+    logerror("target y %d >= height %u", y, n->leny);
+    return -1;
   }else{
     n->y = y;
   }
   if(cursor_invalid_p(n)){
+    logerror("invalid cursor following move (%d/%d)", n->y, n->x);
     return -1;
   }
   return 0;
 }
 
-ncplane* ncplane_dup(ncplane* n, void* opaque){
+int ncplane_cursor_move_rel(ncplane* n, int y, int x){
+  if((int)n->y + y == -1){
+    logerror("invalid target y -1");
+    return -1;
+  }else if((int)n->x + x == -1){
+    logerror("invalid target x -1");
+    return -1;
+  }else return ncplane_cursor_move_yx(n, n->y + y, n->x + x);
+}
+
+ncplane* ncplane_dup(const ncplane* n, void* opaque){
   int dimy = n->leny;
   int dimx = n->lenx;
-  int aty = n->absy;
-  int atx = n->absx;
-  int y = n->y;
-  int x = n->x;
-  uint32_t attr = ncplane_attr(n);
-  uint64_t chan = ncplane_channels(n);
-  ncplane* newn = ncplane_create(n->nc, n->bound, dimy, dimx, aty, atx, opaque);
-  if(newn){
-    if(egcpool_dup(&newn->pool, &n->pool)){
-      ncplane_destroy(newn);
-    }else{
-      ncplane_cursor_move_yx(newn, y, x);
-      n->attrword = attr;
-      n->channels = chan;
-      ncplane_move_above_unsafe(newn, n);
-      memmove(newn->fb, n->fb, sizeof(*n->fb) * dimx * dimy);
-    }
+  const int placey = n->absy;
+  const int placex = n->absx;
+  struct ncplane_options nopts = {
+    .y = placey,
+    .x = placex,
+    .rows = dimy,
+    .cols = dimx,
+    .userptr = opaque,
+    .name = n->name,
+    .resizecb = ncplane_resizecb(n),
+    .flags = 0,
+  };
+  ncplane* newn = ncplane_create(n->boundto, &nopts);
+  if(newn == NULL){
+    return NULL;
   }
+  // we don't duplicate sprites...though i'm unsure why not
+  size_t fbsize = sizeof(*n->fb) * dimx * dimy;
+  if(egcpool_dup(&newn->pool, &n->pool)){
+    ncplane_destroy(newn);
+    return NULL;
+  }
+  memmove(newn->fb, n->fb, fbsize);
+  // don't use ncplane_cursor_move_yx() here; the cursor could be in an
+  // invalid location, which will be disallowed, failing out.
+  newn->y = n->y;
+  newn->x = n->x;
+  newn->halign = n->halign;
+  newn->stylemask = ncplane_styles(n);
+  newn->channels = ncplane_channels(n);
+  // we dupd the egcpool, so just dup the goffset
+  newn->basecell = n->basecell;
   return newn;
 }
 
-// can be used on stdscr, unlike ncplane_resize() which prohibits it.
-int ncplane_resize_internal(ncplane* n, int keepy, int keepx, int keepleny,
-                            int keeplenx, int yoff, int xoff, int ylen, int xlen){
-  if(keepleny < 0 || keeplenx < 0){ // can't retain negative size
-//fprintf(stderr, "Can't retain negative size %dx%d\n", keepleny, keeplenx);
-    return -1;
+// call the resize callback for each bound child in turn. we only need to do
+// the first generation; if they resize, they'll invoke
+// ncplane_resize_internal(), leading to this function being called anew.
+int resize_callbacks_children(ncplane* n){
+  int ret = 0;
+  for(struct ncplane* child = n->blist ; child ; child = child->bnext){
+    if(child->resizecb){
+      ret |= child->resizecb(child);
+    }
   }
-  if(ylen <= 0 || xlen <= 0){ // can't resize to trivial or negative size
-//fprintf(stderr, "Can't achieve negative size %dx%d\n", ylen, xlen);
+  return ret;
+}
+
+// basic consistency checks on resize requests
+static int
+ncplane_resize_internal_check(const ncplane* n, int keepy, int keepx,
+                              unsigned keepleny, unsigned keeplenx,
+                              int yoff, int xoff, unsigned ylen, unsigned xlen,
+                              unsigned* rows, unsigned* cols){
+  if(keepy < 0 || keepx < 0){ // can't start at negative origin
+    logerror("can't retain negative offset %dx%d", keepy, keepx);
     return -1;
   }
   if((!keepleny && keeplenx) || (keepleny && !keeplenx)){ // both must be 0
-//fprintf(stderr, "Can't keep zero dimensions %dx%d\n", keepleny, keeplenx);
+    logerror("can't retain null dimension %ux%u", keepleny, keeplenx);
     return -1;
   }
-  if(ylen < keepleny || xlen < keeplenx){ // can't be smaller than our keep
-//fprintf(stderr, "Can't violate space %dx%d vs %dx%d\n", keepleny, keeplenx, ylen, xlen);
+  // can't be smaller than keep length
+  if(ylen < keepleny){
+    logerror("can't map in y dimension: %u < %u", ylen, keepleny);
     return -1;
   }
-  int rows, cols;
-  ncplane_dim_yx(n, &rows, &cols);
-//fprintf(stderr, "NCPLANE(RESIZING) to %dx%d at %d/%d (keeping %dx%d from %d/%d)\n",
-//        ylen, xlen, yoff, xoff, keepleny, keeplenx, keepy, keepx);
+  if(xlen < keeplenx){
+    logerror("can't map in x dimension: %u < %u", xlen, keeplenx);
+    return -1;
+  }
+  if(ylen <= 0 || xlen <= 0){ // can't resize to trivial or negative size
+    logerror("can't achieve meaningless size %ux%u", ylen, xlen);
+    return -1;
+  }
+  ncplane_dim_yx(n, rows, cols);
+  if(keepleny + keepy > *rows){
+    logerror("can't keep %u@%d rows from %u", keepleny, keepy, *rows);
+    return -1;
+  }
+  if(keeplenx + keepx > *cols){
+    logerror("can't keep %u@%d cols from %u", keeplenx, keepx, *cols);
+    return -1;
+  }
+  loginfo("%ux%u @ %d/%d → %u/%u @ %d/%d (want %ux%u@%d/%d)", *rows, *cols,
+          n->absy, n->absx, ylen, xlen, n->absy + keepy + yoff, n->absx + keepx + xoff,
+          keepleny, keeplenx, keepy, keepx);
+  return 0;
+}
+
+// can be used on stdplane, unlike ncplane_resize() which prohibits it.
+int ncplane_resize_internal(ncplane* n, int keepy, int keepx,
+                            unsigned keepleny, unsigned keeplenx,
+                            int yoff, int xoff,
+                            unsigned ylen, unsigned xlen){
+  unsigned rows, cols;
+  if(ncplane_resize_internal_check(n, keepy, keepx, keepleny, keeplenx,
+                                   yoff, xoff, ylen, xlen,
+                                   &rows, &cols)){
+    return -1;
+  }
+  if(n->absy == n->absy + keepy && n->absx == n->absx + keepx &&
+      rows == ylen && cols == xlen){
+    return 0;
+  }
+  notcurses* nc = ncplane_notcurses(n);
+  if(n->sprite){
+    sprixel_hide(n->sprite);
+  }
   // we're good to resize. we'll need alloc up a new framebuffer, and copy in
   // those elements we're retaining, zeroing out the rest. alternatively, if
   // we've shrunk, we will be filling the new structure.
+  int oldarea = rows * cols;
   int keptarea = keepleny * keeplenx;
   int newarea = ylen * xlen;
-  size_t fbsize = sizeof(cell) * newarea;
-  cell* fb = malloc(fbsize);
-  if(fb == NULL){
-    return -1;
+  size_t fbsize = sizeof(nccell) * newarea;
+  nccell* fb;
+  // there are two cases worth optimizing:
+  //
+  // * nothing is kept. we malloc() a new cellmatrix, dump the EGCpool in
+  //    toto, and zero out the matrix. no copies, one memset.
+  // * old and new x dimensions match, and we're keeping the full width.
+  //    we release any cells we're about to lose, realloc() the cellmatrix,
+  //    and zero out any new cells. so long as the realloc() doesn't move
+  //    us, there are no copies, one memset, one iteration (since this is
+  //    most often due to autogrowth by a single line, the likelihood that
+  //    we remain where we are is pretty high).
+  // * otherwise, we malloc() a new cellmatrix, zero out any new cells,
+  //    copy over any reused cells, and release any lost cells. one
+  //    gigantic iteration.
+  // we might realloc instead of mallocing, in which case we NULL out
+  // |preserved|. it must otherwise be free()d at the end.
+  nccell* preserved = n->fb;
+  if(cols == xlen && cols == keeplenx && keepleny && !keepy){
+    // we need release the cells that we're losing, lest we leak EGCpool
+    // memory. unfortunately, this means we mutate the plane on the error case.
+    // any solution would involve copying them out first. we only do this if
+    // we're keeping some, as we otherwise drop the EGCpool in toto.
+    if(n->leny > keepleny){
+      for(unsigned y = keepleny ; y < n->leny ; ++y){
+        for(unsigned x = 0 ; x < n->lenx ; ++x){
+          nccell_release(n, ncplane_cell_ref_yx(n, y, x));
+        }
+      }
+    }
+    if((fb = realloc(n->fb, fbsize)) == NULL){
+      return -1;
+    }
+    preserved = NULL;
+  }else{
+    if((fb = malloc(fbsize)) == NULL){
+      return -1;
+    }
+  }
+  if(n->tam){
+    loginfo("tam realloc to %d entries", newarea);
+    // FIXME first, free any disposed auxiliary vectors!
+    tament* tmptam = realloc(n->tam, sizeof(*tmptam) * newarea);
+    if(tmptam == NULL){
+      if(preserved){
+        free(fb);
+      }
+      return -1;
+    }
+    n->tam = tmptam;
+    if(newarea > oldarea){
+      memset(n->tam + oldarea, 0, sizeof(*n->tam) * (newarea - oldarea));
+    }
   }
   // update the cursor, if it would otherwise be off-plane
   if(n->y >= ylen){
@@ -430,63 +939,78 @@ int ncplane_resize_internal(ncplane* n, int keepy, int keepx, int keepleny,
   if(n->x >= xlen){
     n->x = xlen - 1;
   }
-  cell* preserved = n->fb;
-  n->nc->stats.fbbytes -= sizeof(*preserved) * (rows * cols);
-  n->nc->stats.fbbytes += fbsize;
-  n->fb = fb;
-  n->absy = n->absy + keepy - yoff;
-  n->absx = n->absx + keepx - xoff;
-  // if we're keeping nothing, dump the old egcspool. otherwise, we go ahead
-  // and keep it. perhaps we ought compact it?
-  if(keptarea == 0){ // keep nothing, resize/move only
+  pthread_mutex_lock(&nc->stats.lock);
+    ncplane_notcurses(n)->stats.s.fbbytes -= sizeof(*fb) * (rows * cols);
+    ncplane_notcurses(n)->stats.s.fbbytes += fbsize;
+  pthread_mutex_unlock(&nc->stats.lock);
+  const int oldabsy = n->absy;
+  // go ahead and move. we can no longer fail at this point. but don't yet
+  // resize, because n->len[xy] are used in fbcellidx() in the loop below. we
+  // don't use ncplane_move_yx(), because we want to planebinding-invariant.
+  n->absy += keepy + yoff;
+  n->absx += keepx + xoff;
+//fprintf(stderr, "absx: %d keepx: %d xoff: %d\n", n->absx, keepx, xoff);
+  if(keptarea == 0){ // keep nothing, resize/move only.
+    // if we're keeping nothing, dump the old egcspool. otherwise, we go ahead
+    // and keep it. perhaps we ought compact it?
     memset(fb, 0, sizeof(*fb) * newarea);
     egcpool_dump(&n->pool);
-    n->lenx = xlen;
-    n->leny = ylen;
-    free(preserved);
-    return 0;
+  }else if(!preserved){
+    // the x dimensions are equal, and we're keeping across the width. only the
+    // y dimension changed. if we grew, we need zero out the new cells (if we
+    // shrunk, we already released the old cells prior to the realloc).
+    unsigned tozorch = (ylen - keepleny) * xlen * sizeof(*fb);
+    if(tozorch){
+      unsigned zorchoff = keepleny * xlen;
+      memset(fb + zorchoff, 0, tozorch);
+    }
+  }else{
+    // we currently have maxy rows of maxx cells each. we will be keeping rows
+    // keepy..keepy + keepleny - 1 and columns keepx..keepx + keeplenx - 1.
+    // anything else is zerod out. itery is the row we're writing *to*, and we
+    // must write to each (and every cell in each).
+    for(unsigned itery = 0 ; itery < ylen ; ++itery){
+      int truey = itery + n->absy;
+      int sourceoffy = truey - oldabsy;
+//fprintf(stderr, "sourceoffy: %d keepy: %d ylen: %d\n", sourceoffy, keepy, ylen);
+      // if we have nothing copied to this line, zero it out in one go
+      if(sourceoffy < keepy || sourceoffy >= keepy + (int)keepleny){
+//fprintf(stderr, "writing 0s to line %d of %d\n", itery, ylen);
+        memset(fb + (itery * xlen), 0, sizeof(*fb) * xlen);
+      }else{
+        int copyoff = itery * xlen; // our target at any given time
+        // we do have something to copy, and zero, one, or two regions to zero out
+        unsigned copied = 0;
+        if(xoff < 0){
+          memset(fb + copyoff, 0, sizeof(*fb) * -xoff);
+          copyoff += -xoff;
+          copied += -xoff;
+        }
+        const int sourceidx = nfbcellidx(n, sourceoffy, keepx);
+//fprintf(stderr, "copying line %d (%d) to %d (%d)\n", sourceoffy, sourceidx, copyoff / xlen, copyoff);
+        memcpy(fb + copyoff, preserved + sourceidx, sizeof(*fb) * keeplenx);
+        copyoff += keeplenx;
+        copied += keeplenx;
+        unsigned perline = xlen - copied;
+        for(unsigned x = copyoff ; x < n->lenx ; ++x){
+          nccell_release(n, ncplane_cell_ref_yx(n, sourceoffy, x));
+        }
+        memset(fb + copyoff, 0, sizeof(*fb) * perline);
+      }
+    }
   }
-  // we currently have maxy rows of maxx cells each. we will be keeping rows
-  // keepy..keepy + keepleny - 1 and columns keepx..keepx + keeplenx - 1. they
-  // will end up at keepy + yoff..keepy + keepleny - 1 + yoff and
-  // keepx + xoff..keepx + keeplenx - 1 + xoff. everything else is zerod out.
-  int itery;
-  // we'll prepare each cell in our new framebuffer with either zeroes or a copy
-  // from the old one.
-  int sourceline = keepy;
-  for(itery = 0 ; itery < ylen ; ++itery){
-    int copyoff = itery * xlen; // our target at any given time
-    // FIXME in memset()s here of existing text, don't we need cell_release()?
-    // if we have nothing copied to this line, zero it out in one go
-    if(itery < keepy || itery > keepy + keepleny - 1){
-      memset(fb + copyoff, 0, sizeof(*fb) * xlen);
-      continue;
-    }
-    // we do have something to copy, and zero, one, or two regions to zero out
-    int copied = 0;
-    if(xoff < 0){
-      memset(fb + copyoff, 0, sizeof(*fb) * -xoff);
-      copyoff += -xoff;
-      copied += -xoff;
-    }
-    const int sourceidx = nfbcellidx(n, sourceline, keepx);
-    memcpy(fb + copyoff, preserved + sourceidx, sizeof(*fb) * keeplenx);
-    copyoff += keeplenx;
-    copied += keeplenx;
-    if(xlen > copied){
-      memset(fb + copyoff, 0, sizeof(*fb) * (xlen - copied));
-    }
-    ++sourceline;
-  }
+  n->fb = fb;
   n->lenx = xlen;
   n->leny = ylen;
   free(preserved);
-  return 0;
+  return resize_callbacks_children(n);
 }
 
-int ncplane_resize(ncplane* n, int keepy, int keepx, int keepleny,
-                   int keeplenx, int yoff, int xoff, int ylen, int xlen){
-  if(n == n->nc->stdscr){
+int ncplane_resize(ncplane* n, int keepy, int keepx,
+                   unsigned keepleny, unsigned keeplenx,
+                   int yoff, int xoff,
+                   unsigned ylen, unsigned xlen){
+  if(n == ncplane_notcurses(n)->stdplane){
 //fprintf(stderr, "Can't resize standard plane\n");
     return -1;
   }
@@ -494,718 +1018,730 @@ int ncplane_resize(ncplane* n, int keepy, int keepx, int keepleny,
                                  yoff, xoff, ylen, xlen);
 }
 
-// find the pointer on the z-index referencing the specified plane. writing to
-// this pointer will remove the plane (and everything below it) from the stack.
-static ncplane**
-find_above_ncplane(ncplane* n){
-  notcurses* nc = n->nc;
-  ncplane** above = &nc->top;
-  while(*above){
-    if(*above == n){
-      return above;
-    }
-    above = &((*above)->z);
-  }
-  return NULL;
-}
-
 int ncplane_destroy(ncplane* ncp){
   if(ncp == NULL){
     return 0;
   }
-  if(ncp->nc->stdscr == ncp){
+  if(ncplane_notcurses(ncp)->stdplane == ncp){
+    logerror("won't destroy standard plane");
     return -1;
   }
-  ncplane** above = find_above_ncplane(ncp);
-  if(above == NULL){
-    return -1;
+//notcurses_debug(ncplane_notcurses(ncp), stderr);
+  loginfo("destroying %dx%d plane \"%s\" @ %dx%d",
+          ncp->leny, ncp->lenx, ncp->name ? ncp->name : NULL, ncp->absy, ncp->absx);
+  int ret = 0;
+  // dissolve our binding from behind (->bprev is either NULL, or its
+  // predecessor on the bound list's ->bnext, or &ncp->boundto->blist)
+  if(ncp->bprev){
+    if( (*ncp->bprev = ncp->bnext) ){
+      ncp->bnext->bprev = ncp->bprev;
+    }
+  }else if(ncp->bnext){
+    //assert(ncp->boundto->blist == ncp);
+    ncp->bnext->bprev = NULL;
   }
-  *above = ncp->z; // splice it out of the list
+  // recursively reparent our children to the plane to which we are bound.
+  // this will extract each one from the sibling list.
+  struct ncplane* bound = ncp->blist;
+  while(bound){
+    struct ncplane* tmp = bound->bnext;
+    ncplane* bindto = ((ncp == ncp->boundto) ? bound : ncp->boundto);
+    if(ncplane_reparent_family(bound, bindto) == NULL){
+      ret = -1;
+    }
+    bound = tmp;
+  }
+  // extract ourselves from the z-axis. do this *after* reparenting, in case
+  // reparenting shifts up the z-axis somehow (though i don't think it can,
+  // at least not within a pile?).
+  if(ncp->above){
+    ncp->above->below = ncp->below;
+  }else{
+    ncplane_pile(ncp)->top = ncp->below;
+  }
+  if(ncp->below){
+    ncp->below->above = ncp->above;
+  }else{
+    ncplane_pile(ncp)->bottom = ncp->above;
+  }
   free_plane(ncp);
-  return 0;
-}
-
-static bool
-query_rgb(void){
-  bool rgb = tigetflag("RGB") == 1;
-  if(!rgb){
-    // RGB terminfo capability being a new thing (as of ncurses 6.1), it's not commonly found in
-    // terminal entries today. COLORTERM, however, is a de-facto (if imperfect/kludgy) standard way
-    // of indicating TrueColor support for a terminal. The variable takes one of two case-sensitive
-    // values:
-    //
-    //   truecolor
-    //   24bit
-    //
-    // https://gist.github.com/XVilka/8346728#true-color-detection gives some more information about
-    // the topic
-    //
-    const char* cterm = getenv("COLORTERM");
-    rgb = cterm && (strcmp(cterm, "truecolor") == 0 || strcmp(cterm, "24bit") == 0);
-  }
-  return rgb;
-}
-
-static int
-interrogate_terminfo(notcurses* nc, const notcurses_options* opts, int* dimy, int* dimx){
-  update_term_dimensions(nc->ttyfd, dimy, dimx);
-  nc->truecols = *dimx;
-  char* shortname_term = termname();
-  char* longname_term = longname();
-  if(!opts->suppress_banner){
-    fprintf(stderr, "Term: %dx%d %s (%s)\n", *dimx, *dimy,
-            shortname_term ? shortname_term : "?",
-            longname_term ? longname_term : "?");
-  }
-  nc->RGBflag = query_rgb();
-  if((nc->colors = tigetnum("colors")) <= 0){
-    if(!opts->suppress_banner){
-      fprintf(stderr, "This terminal doesn't appear to support colors\n");
-    }
-    nc->colors = 1;
-    nc->CCCflag = false;
-    nc->RGBflag = false;
-    nc->initc = NULL;
-  }else{
-    term_verify_seq(&nc->initc, "initc");
-    if(nc->initc){
-      nc->CCCflag = tigetflag("ccc") == 1;
-    }else{
-      nc->CCCflag = false;
-    }
-  }
-  term_verify_seq(&nc->cup, "cup");
-  if(nc->cup == NULL){
-    fprintf(stderr, "Required terminfo capability 'cup' not defined\n");
-    return -1;
-  }
-  nc->AMflag = tigetflag("am") == 1;
-  if(!nc->AMflag){
-    fprintf(stderr, "Required terminfo capability 'am' not defined\n");
-    return -1;
-  }
-  term_verify_seq(&nc->civis, "civis");
-  term_verify_seq(&nc->cnorm, "cnorm");
-  term_verify_seq(&nc->standout, "smso"); // smso / rmso
-  term_verify_seq(&nc->uline, "smul");
-  term_verify_seq(&nc->reverse, "reverse");
-  term_verify_seq(&nc->blink, "blink");
-  term_verify_seq(&nc->dim, "dim");
-  term_verify_seq(&nc->bold, "bold");
-  term_verify_seq(&nc->italics, "sitm");
-  term_verify_seq(&nc->italoff, "ritm");
-  term_verify_seq(&nc->sgr, "sgr");
-  term_verify_seq(&nc->sgr0, "sgr0");
-  term_verify_seq(&nc->op, "op");
-  term_verify_seq(&nc->oc, "oc");
-  term_verify_seq(&nc->home, "home");
-  term_verify_seq(&nc->clearscr, "clear");
-  term_verify_seq(&nc->cleareol, "el");
-  term_verify_seq(&nc->clearbol, "el1");
-  term_verify_seq(&nc->cuf, "cuf"); // n non-destructive spaces
-  term_verify_seq(&nc->cub, "cub"); // n non-destructive backspaces
-  term_verify_seq(&nc->cuf1, "cuf1"); // non-destructive space
-  term_verify_seq(&nc->cub1, "cub1"); // non-destructive backspace
-  term_verify_seq(&nc->smkx, "smkx"); // set application mode
-  if(nc->smkx){
-    if(putp(tiparm(nc->smkx)) != OK){
-      fprintf(stderr, "Error entering application mode\n");
-      return -1;
-    }
-  }
-  if(prep_special_keys(nc)){
-    return -1;
-  }
-  // Some terminals cannot combine certain styles with colors. Don't advertise
-  // support for the style in that case.
-  int nocolor_stylemask = tigetnum("ncv");
-  if(nocolor_stylemask > 0){
-    if(nocolor_stylemask & WA_STANDOUT){ // ncv is composed of terminfo bits, not ours
-      nc->standout = NULL;
-    }
-    if(nocolor_stylemask & WA_UNDERLINE){
-      nc->uline = NULL;
-    }
-    if(nocolor_stylemask & WA_REVERSE){
-      nc->reverse = NULL;
-    }
-    if(nocolor_stylemask & WA_BLINK){
-      nc->blink = NULL;
-    }
-    if(nocolor_stylemask & WA_DIM){
-      nc->dim = NULL;
-    }
-    if(nocolor_stylemask & WA_BOLD){
-      nc->bold = NULL;
-    }
-    if(nocolor_stylemask & WA_ITALIC){
-      nc->italics = NULL;
-    }
-  }
-  term_verify_seq(&nc->getm, "getm"); // get mouse events
-  // Not all terminals support setting the fore/background independently
-  term_verify_seq(&nc->setaf, "setaf");
-  term_verify_seq(&nc->setab, "setab");
-  term_verify_seq(&nc->smkx, "smkx");
-  term_verify_seq(&nc->rmkx, "rmkx");
-  // Neither of these is supported on e.g. the "linux" virtual console.
-  if(!opts->inhibit_alternate_screen){
-    term_verify_seq(&nc->smcup, "smcup");
-    term_verify_seq(&nc->rmcup, "rmcup");
-  }else{
-    nc->smcup = nc->rmcup = NULL;
-  }
-  nc->top = nc->stdscr = NULL;
-  return 0;
-}
-
-static int
-make_nonblocking(FILE* fp){
-  int fd = fileno(fp);
-  if(fd < 0){
-    return -1;
-  }
-  int flags = fcntl(fd, F_GETFL, 0);
-  if(flags < 0){
-    return -1;
-  }
-  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-static void
-reset_stats(ncstats* stats){
-  uint64_t fbbytes = stats->fbbytes;
-  memset(stats, 0, sizeof(*stats));
-  stats->render_min_ns = 1ull << 62u;
-  stats->render_min_bytes = 1ull << 62u;
-  stats->fbbytes = fbbytes;
-}
-
-// add the current stats to the cumulative stashed stats, and reset them
-static void
-stash_stats(notcurses* nc){
-  nc->stashstats.renders += nc->stats.renders;
-  nc->stashstats.render_ns += nc->stats.render_ns;
-  nc->stashstats.failed_renders += nc->stats.failed_renders;
-  nc->stashstats.render_bytes += nc->stats.render_bytes;
-  if(nc->stashstats.render_max_bytes < nc->stats.render_max_bytes){
-    nc->stashstats.render_max_bytes = nc->stats.render_max_bytes;
-  }
-  if(nc->stashstats.render_max_ns < nc->stats.render_max_ns){
-    nc->stashstats.render_max_ns = nc->stats.render_max_ns;
-  }
-  if(nc->stashstats.render_min_bytes > nc->stats.render_min_bytes){
-    nc->stashstats.render_min_bytes = nc->stats.render_min_bytes;
-  }
-  if(nc->stashstats.render_min_ns > nc->stats.render_min_ns){
-    nc->stashstats.render_min_ns = nc->stats.render_min_ns;
-  }
-  nc->stashstats.cellelisions += nc->stats.cellelisions;
-  nc->stashstats.cellemissions += nc->stats.cellemissions;
-  nc->stashstats.fgelisions += nc->stats.fgelisions;
-  nc->stashstats.fgemissions += nc->stats.fgemissions;
-  nc->stashstats.bgelisions += nc->stats.bgelisions;
-  nc->stashstats.bgemissions += nc->stats.bgemissions;
-  nc->stashstats.defaultelisions += nc->stats.defaultelisions;
-  nc->stashstats.defaultemissions += nc->stats.defaultemissions;
-  // fbbytes aren't stashed
-  reset_stats(&nc->stats);
-}
-
-void notcurses_stats(const notcurses* nc, ncstats* stats){
-  memcpy(stats, &nc->stats, sizeof(*stats));
-}
-
-void notcurses_reset_stats(notcurses* nc, ncstats* stats){
-  memcpy(stats, &nc->stats, sizeof(*stats));
-  stash_stats(nc);
-}
-
-// Convert a notcurses log level to its ffmpeg equivalent.
-static int
-ffmpeg_log_level(ncloglevel_e level){
-#ifdef USE_FFMPEG
-  switch(level){
-    case NCLOGLEVEL_SILENT: return AV_LOG_QUIET;
-    case NCLOGLEVEL_PANIC: return AV_LOG_PANIC;
-    case NCLOGLEVEL_FATAL: return AV_LOG_FATAL;
-    case NCLOGLEVEL_ERROR: return AV_LOG_ERROR;
-    case NCLOGLEVEL_WARNING: return AV_LOG_WARNING;
-    case NCLOGLEVEL_INFO: return AV_LOG_INFO;
-    case NCLOGLEVEL_VERBOSE: return AV_LOG_VERBOSE;
-    case NCLOGLEVEL_DEBUG: return AV_LOG_DEBUG;
-    case NCLOGLEVEL_TRACE: return AV_LOG_TRACE;
-    default: break;
-  }
-  fprintf(stderr, "Invalid log level: %d\n", level);
-  return AV_LOG_TRACE;
-#else
-  return level;
-#endif
-}
-
-ncdirect* ncdirect_init(const char* termtype, FILE* outfp){
-  if(outfp == NULL){
-    outfp = stdout;
-  }
-  ncdirect* ret = malloc(sizeof(*ret));
-  if(ret == NULL){
-    return ret;
-  }
-  ret->ttyfp = outfp;
-  memset(&ret->palette, 0, sizeof(ret->palette));
-  int ttyfd = fileno(ret->ttyfp);
-  if(ttyfd < 0){
-    fprintf(stderr, "No file descriptor was available in outfp %p\n", outfp);
-    free(ret);
-    return NULL;
-  }
-  int termerr;
-  if(setupterm(termtype, ttyfd, &termerr) != OK){
-    fprintf(stderr, "Terminfo error %d (see terminfo(3ncurses))\n", termerr);
-    free(ret);
-    return NULL;
-  }
-  term_verify_seq(&ret->standout, "smso"); // smso / rmso
-  term_verify_seq(&ret->uline, "smul");
-  term_verify_seq(&ret->reverse, "reverse");
-  term_verify_seq(&ret->blink, "blink");
-  term_verify_seq(&ret->dim, "dim");
-  term_verify_seq(&ret->bold, "bold");
-  term_verify_seq(&ret->italics, "sitm");
-  term_verify_seq(&ret->italoff, "ritm");
-  term_verify_seq(&ret->sgr, "sgr");
-  term_verify_seq(&ret->sgr0, "sgr0");
-  term_verify_seq(&ret->op, "op");
-  term_verify_seq(&ret->oc, "oc");
-  term_verify_seq(&ret->setaf, "setaf");
-  term_verify_seq(&ret->setab, "setab");
-  term_verify_seq(&ret->clear, "clear");
-  term_verify_seq(&ret->cup, "cup");
-  term_verify_seq(&ret->cuu, "cuu"); // move N up
-  term_verify_seq(&ret->cuf, "cuf"); // move N right
-  term_verify_seq(&ret->cud, "cud"); // move N down
-  term_verify_seq(&ret->cub, "cub"); // move N left
-  term_verify_seq(&ret->hpa, "hpa");
-  term_verify_seq(&ret->vpa, "vpa");
-  term_verify_seq(&ret->civis, "civis");
-  term_verify_seq(&ret->cnorm, "cnorm");
-  ret->RGBflag = query_rgb();
-  if((ret->colors = tigetnum("colors")) <= 0){
-    ret->colors = 1;
-    ret->CCCflag = false;
-    ret->RGBflag = false;
-    ret->initc = NULL;
-  }else{
-    term_verify_seq(&ret->initc, "initc");
-    if(ret->initc){
-      ret->CCCflag = tigetflag("ccc") == 1;
-    }else{
-      ret->CCCflag = false;
-    }
-  }
-  ret->fgdefault = ret->bgdefault = true;
-  ret->fgrgb = ret->bgrgb = 0;
-  ncdirect_styles_set(ret, 0);
   return ret;
 }
 
-notcurses* notcurses_init(const notcurses_options* opts, FILE* outfp){
-  if(outfp == NULL){
-    outfp = stdout;
+int ncplane_family_destroy(ncplane *ncp){
+  if(ncp == NULL){
+    return 0;
   }
-  notcurses_options defaultopts;
-  memset(&defaultopts, 0, sizeof(defaultopts));
-  if(!opts){
-    opts = &defaultopts;
+  if(ncplane_notcurses(ncp)->stdplane == ncp){
+    logerror("won't destroy standard plane");
+    return -1;
   }
-  if(opts->margin_t < 0 || opts->margin_b < 0 || opts->margin_l < 0 || opts->margin_r < 0){
-    fprintf(stderr, "Provided an illegal negative margin, refusing to start\n");
-    return NULL;
+  int ret = 0;
+  while(ncp->blist){
+    ret |= ncplane_family_destroy(ncp->blist);
   }
+  ret |= ncplane_destroy(ncp);
+  return ret;
+}
+
+// it's critical that we're using UTF-8 encoding if at all possible. since the
+// client might not have called setlocale(2) (if they weren't reading the
+// directions...), go ahead and try calling setlocale(LC_ALL, "") and then
+// setlocale(LC_CTYPE, "C.UTF-8") ourselves *iff* we're not using UTF-8 *and*
+// LANG is not explicitly set to "C" nor "POSIX". this still requires the user
+// to have a proper locale generated and available on disk. either way, they're
+// going to get a diagnostic (unless the user has explicitly configured a LANG
+// of "C" or "POSIX"). recommended practice is for the client code to have
+// called setlocale() themselves, and set the NCOPTION_INHIBIT_SETLOCALE flag.
+// if that flag is set, we take the locale and encoding as we get them.
+void init_lang(void){
+#ifdef __MINGW32__
+  if(setlocale(LC_ALL, ".UTF8") == NULL){
+    logwarn("couldn't set LC_ALL to utf8");
+  }
+#endif
   const char* encoding = nl_langinfo(CODESET);
-  if(encoding == NULL || (strcmp(encoding, "ANSI_X3.4-1968") && strcmp(encoding, "UTF-8"))){
-    fprintf(stderr, "Encoding (\"%s\") was neither ANSI_X3.4-1968 nor UTF-8, refusing to start\n Did you call setlocale()?\n",
-            encoding ? encoding : "none found");
+  if(encoding && encoding_is_utf8(encoding)){
+    return; // already utf-8, great!
+  }
+  const char* lang = getenv("LANG");
+  // if LANG was explicitly set to C/POSIX, life sucks, roll with it
+  if(lang && (!strcmp(lang, "C") || !strcmp(lang, "POSIX"))){
+    loginfo("LANG was explicitly set to %s, not changing locale", lang);
+    return;
+  }
+#ifndef __MINGW32__
+  if(setlocale(LC_ALL, "") == NULL){
+    logwarn("setting locale based on LANG failed");
+  }
+#endif
+  encoding = nl_langinfo(CODESET);
+  if(encoding && encoding_is_utf8(encoding)){
+    loginfo("set locale from LANG; client should call setlocale(2)!");
+    return;
+  }
+  setlocale(LC_CTYPE, "C.UTF-8");
+  encoding = nl_langinfo(CODESET);
+  if(encoding && encoding_is_utf8(encoding)){
+    loginfo("forced UTF-8 encoding; client should call setlocale(2)!");
+    return;
+  }
+}
+
+// initialize a recursive mutex lock in a way that works on both glibc + musl
+static int
+recursive_lock_init(pthread_mutex_t *lock){
+#ifndef __GLIBC__
+#define PTHREAD_MUTEX_RECURSIVE_NP PTHREAD_MUTEX_RECURSIVE
+#endif
+  pthread_mutexattr_t attr;
+  if(pthread_mutexattr_init(&attr)){
+    return -1;
+  }
+  if(pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE_NP)){
+    pthread_mutexattr_destroy(&attr);
+    return -1;
+  }
+  if(pthread_mutex_init(lock, &attr)){
+    pthread_mutexattr_destroy(&attr);
+    return -1;
+  }
+  pthread_mutexattr_destroy(&attr);
+  return 0;
+#ifndef __GLIBC__
+#undef PTHREAD_MUTEX_RECURSIVE_NP
+#endif
+}
+
+ncpixelimpl_e notcurses_check_pixel_support(const notcurses* nc){
+  if(nc->tcache.cellpxy == 0 || nc->tcache.cellpxx == 0){
+    return NCPIXEL_NONE;
+  }
+  return nc->tcache.pixel_implementation;
+}
+
+// the earliest stage of initialization. logging does not yet work; all
+// diagostics should be emitted with fprintf(stderr).
+//  * validates |opts|, if not NULL
+//  * creates and zeroes out the notcurses struct
+//  * ensures that we're using ASCII or UTF8 and calls setlocale(3)
+//  * checks the environment for NOTCURSES_LOGLEVEL and sets ret->loglevel
+//  * writes TERM to the environment, if specified via opts->termtype
+//
+// iff we're using UTF8, |utf8| will be set to 1. it is otherwise set to 0.
+__attribute__ ((nonnull (2))) static notcurses*
+notcurses_early_init(const struct notcurses_options* opts, FILE* fp, unsigned* utf8){
+  if(fwide(fp, 0) > 0){
+    fprintf(stderr, "error: output stream is wide-oriented");
     return NULL;
   }
-  struct termios modtermios;
   notcurses* ret = malloc(sizeof(*ret));
   if(ret == NULL){
     return ret;
   }
-  ret->margin_t = opts->margin_t;
-  ret->margin_b = opts->margin_b;
-  ret->margin_l = opts->margin_l;
-  ret->margin_r = opts->margin_r;
-  ret->stats.fbbytes = 0;
-  ret->stashstats.fbbytes = 0;
-  reset_stats(&ret->stats);
-  reset_stats(&ret->stashstats);
-  ret->ttyfp = outfp;
-  ret->renderfp = opts->renderfp;
-  ret->inputescapes = NULL;
-  ret->ttyinfp = stdin; // FIXME
-  memset(&ret->rstate, 0, sizeof(ret->rstate));
-  memset(&ret->palette_damage, 0, sizeof(ret->palette_damage));
-  memset(&ret->palette, 0, sizeof(ret->palette));
-  ret->lastframe = NULL;
-  ret->lfdimy = 0;
-  ret->lfdimx = 0;
+  memset(ret, 0, sizeof(*ret));
+  if(opts){
+    if(opts->flags >= (NCOPTION_SCROLLING << 1u)){
+      fprintf(stderr, "warning: unknown Notcurses options %016" PRIu64, opts->flags);
+    }
+    if(opts->termtype){
+      if(putenv_term(opts->termtype)){
+        free(ret);
+        return NULL;
+      }
+    }
+    ret->flags = opts->flags;
+    ret->margin_t = opts->margin_t;
+    ret->margin_b = opts->margin_b;
+    ret->margin_l = opts->margin_l;
+    ret->margin_r = opts->margin_r;
+    ret->loglevel = opts->loglevel;
+  }
+  set_loglevel_from_env(&ret->loglevel);
+  if(!(ret->flags & NCOPTION_INHIBIT_SETLOCALE)){
+    init_lang();
+  }
+//fprintf(stderr, "getenv LC_ALL: %s LC_CTYPE: %s\n", getenv("LC_ALL"), getenv("LC_CTYPE"));
+  const char* encoding = nl_langinfo(CODESET);
+  if(encoding && encoding_is_utf8(encoding)){
+    *utf8 = true;
+  }else{
+    *utf8 = false;
+    if(encoding && (strcmp(encoding, "ANSI_X3.4-1968") &&
+                          strcmp(encoding, "US-ASCII") &&
+                          strcmp(encoding, "ASCII"))){
+      fprintf(stderr, "encoding (\"%s\") was neither ANSI_X3.4-1968 nor UTF-8, refusing to start\n did you call setlocale()?\n",
+              encoding ? encoding : "none found");
+      free(ret);
+      return NULL;
+    }
+  }
+  ret->cursory = ret->cursorx = -1;
+  reset_stats(&ret->stats.s);
+  reset_stats(&ret->stashed_stats);
+  ret->ttyfp = fp;
   egcpool_init(&ret->pool);
-  if(make_nonblocking(ret->ttyinfp)){
+  if(ret->loglevel > NCLOGLEVEL_TRACE || ret->loglevel < NCLOGLEVEL_SILENT){
+    fprintf(stderr, "invalid loglevel %d", ret->loglevel);
     free(ret);
     return NULL;
   }
-  ret->inputbuf_occupied = 0;
-  ret->inputbuf_valid_starts = 0;
-  ret->inputbuf_write_at = 0;
-  ret->input_events = 0;
-  if((ret->ttyfd = fileno(ret->ttyfp)) < 0){
-    fprintf(stderr, "No file descriptor was available in outfp %p\n", outfp);
+  if(recursive_lock_init(&ret->pilelock)){
+    fprintf(stderr, "couldn't initialize pile mutex");
     free(ret);
     return NULL;
   }
-  notcurses_mouse_disable(ret);
-  if(tcgetattr(ret->ttyfd, &ret->tpreserved)){
-    fprintf(stderr, "Couldn't preserve terminal state for %d (%s)\n",
-            ret->ttyfd, strerror(errno));
+  if(pthread_mutex_init(&ret->stats.lock, NULL)){
+    pthread_mutex_destroy(&ret->pilelock);
     free(ret);
     return NULL;
   }
-  memcpy(&modtermios, &ret->tpreserved, sizeof(modtermios));
-  // see termios(3). disabling ECHO and ICANON means input will not be echoed
-  // to the screen, input is made available without enter-based buffering, and
-  // line editing is disabled. since we have not gone into raw mode, ctrl+c
-  // etc. still have their typical effects. ICRNL maps return to 13 (Ctrl+M)
-  // instead of 10 (Ctrl+J).
-  modtermios.c_lflag &= (~ECHO & ~ICANON);
-  modtermios.c_iflag &= (~ICRNL);
-  if(tcsetattr(ret->ttyfd, TCSANOW, &modtermios)){
-    fprintf(stderr, "Error disabling echo / canonical on %d (%s)\n",
-            ret->ttyfd, strerror(errno));
+  if(*utf8){
+    ncmetric_use_utf8();
+  }
+  return ret;
+}
+
+notcurses* notcurses_core_init(const notcurses_options* opts, FILE* outfp){
+  if(outfp == NULL){
+    outfp = stdout;
+  }
+  unsigned utf8;
+  // ret comes out entirely zero-initialized
+  notcurses* ret = notcurses_early_init(opts, outfp, &utf8);
+  if(ret == NULL){
+    return NULL;
+  }
+  // the fbuf is needed by notcurses_stop_minimal, so this must be done
+  // before registering fatal signal handlers.
+  if(fbuf_init(&ret->rstate.f)){
+    pthread_mutex_destroy(&ret->pilelock);
+    pthread_mutex_destroy(&ret->stats.lock);
+    free(ret);
+    return NULL;
+  }
+  if(setup_signals(ret, (ret->flags & NCOPTION_NO_QUIT_SIGHANDLERS),
+                   (ret->flags & NCOPTION_NO_WINCH_SIGHANDLER),
+                   notcurses_stop_minimal)){
+    fbuf_free(&ret->rstate.f);
+    pthread_mutex_destroy(&ret->pilelock);
+    pthread_mutex_destroy(&ret->stats.lock);
+    free(ret);
+    return NULL;
+  }
+  // don't set loglevel until we've acquired the signal handler, lest we
+  // change the loglevel out from under a running instance
+  loglevel = ret->loglevel;
+  ret->rstate.logendy = -1;
+  ret->rstate.logendx = -1;
+  ret->rstate.x = ret->rstate.y = -1;
+  int fakecursory = ret->rstate.logendy;
+  int fakecursorx = ret->rstate.logendx;
+  int* cursory = ret->flags & NCOPTION_PRESERVE_CURSOR ?
+                  &ret->rstate.logendy : &fakecursory;
+  int* cursorx = ret->flags & NCOPTION_PRESERVE_CURSOR ?
+                  &ret->rstate.logendx : &fakecursorx;
+  if(interrogate_terminfo(&ret->tcache, ret->ttyfp, utf8,
+                          ret->flags & NCOPTION_NO_ALTERNATE_SCREEN, 0,
+                          ret->flags & NCOPTION_NO_FONT_CHANGES,
+                          cursory, cursorx, &ret->stats,
+                          ret->margin_l, ret->margin_t,
+                          ret->margin_r, ret->margin_b,
+                          ret->flags & NCOPTION_DRAIN_INPUT)){
+    void* altstack;
+    fbuf_free(&ret->rstate.f);
+    pthread_mutex_destroy(&ret->pilelock);
+    pthread_mutex_destroy(&ret->stats.lock);
+    drop_signals(ret, &altstack);
+    free(ret);
+    free(altstack);
+    return NULL;
+  }
+  if(ret->tcache.maxpaletteread > -1){
+    memcpy(ret->palette.chans, ret->tcache.originalpalette.chans,
+           sizeof(*ret->palette.chans) * (ret->tcache.maxpaletteread + 1));
+  }
+  if((ret->flags & NCOPTION_PRESERVE_CURSOR) ||
+      (!(ret->flags & NCOPTION_SUPPRESS_BANNERS))){
+    // the u7 led the queries so that we would get a cursor position
+    // unaffected by any query spill (unconsumed control sequences). move
+    // us back to that location, in case there was any such spillage.
+    if(*cursory < 0 || *cursorx < 0){
+      unsigned cy, cx;
+      if(locate_cursor(&ret->tcache, &cy, &cx)){
+        logwarn("couldn't preserve cursor");
+      }else{
+        *cursory = cy;
+        *cursorx = cx;
+      }
+    }
+    if(*cursory >= 0 && *cursorx >= 0){
+      if(goto_location(ret, &ret->rstate.f, *cursory, *cursorx, NULL)){
+        goto err;
+      }
+    }
+  }
+  unsigned dimy, dimx, cgeo, pgeo; // latter two are don't-cares
+  if(update_term_dimensions(&dimy, &dimx, &ret->tcache, ret->margin_b, &cgeo, &pgeo)){
     goto err;
   }
-  if(setup_signals(ret, opts->no_quit_sighandlers, opts->no_winch_sighandler)){
+  if(ncvisual_init(ret->loglevel)){
     goto err;
   }
-  int termerr;
-  if(setupterm(opts->termtype, ret->ttyfd, &termerr) != OK){
-    fprintf(stderr, "Terminfo error %d (see terminfo(3ncurses))\n", termerr);
+  ret->stdplane = NULL;
+  if((ret->stdplane = create_initial_ncplane(ret, dimy, dimx)) == NULL){
+    logpanic("couldn't create the initial plane (bad margins?)");
     goto err;
   }
-  int dimy, dimx;
-  if(interrogate_terminfo(ret, opts, &dimy, &dimx)){
+  if(ret->flags & NCOPTION_SCROLLING){
+    ncplane_set_scrolling(ret->stdplane, true);
+  }
+  reset_term_attributes(&ret->tcache, &ret->rstate.f);
+  const char* cinvis = get_escape(&ret->tcache, ESCAPE_CIVIS);
+  if(cinvis && fbuf_emit(&ret->rstate.f, cinvis) < 0){
+    free_plane(ret->stdplane);
     goto err;
   }
-  if(ncvisual_init(ffmpeg_log_level(opts->loglevel))){
+  const char* pushcolors = get_escape(&ret->tcache, ESCAPE_SAVECOLORS);
+  if(pushcolors && fbuf_emit(&ret->rstate.f, pushcolors)){
+    free_plane(ret->stdplane);
     goto err;
   }
-  if((ret->stdscr = create_initial_ncplane(ret, dimy, dimx)) == NULL){
+  init_banner(ret, &ret->rstate.f);
+  if(fbuf_flush(&ret->rstate.f, ret->ttyfp) < 0){
+    free_plane(ret->stdplane);
     goto err;
   }
-  if(!opts->retain_cursor){
-    if(ret->civis && term_emit("civis", ret->civis, ret->ttyfp, false)){
-      free_plane(ret->top);
+  if(ret->rstate.logendy >= 0){ // if either is set, both are
+    if(!(ret->flags & NCOPTION_SUPPRESS_BANNERS) && ret->tcache.ttyfd >= 0){
+      unsigned uendy, uendx;
+      if(locate_cursor(&ret->tcache, &uendy, &uendx)){
+        free_plane(ret->stdplane);
+        goto err;
+      }
+      ret->rstate.logendy = uendy;
+      ret->rstate.logendx = uendx;
+    }
+    if(ret->flags & NCOPTION_PRESERVE_CURSOR){
+      ncplane_cursor_move_yx(ret->stdplane, ret->rstate.logendy, ret->rstate.logendx);
+    }
+  }
+  if(!(ret->flags & NCOPTION_NO_ALTERNATE_SCREEN)){
+    // perform an explicit clear since the alternate screen was requested
+    // (smcup *might* clear, but who knows? and it might not have been
+    // available in any case).
+    if(clear_and_home(ret, &ret->tcache, &ret->rstate.f)){
+      goto err;
+    }
+    // no need to reestablish a preserved cursor -- that only affects the
+    // standard plane, not the physical cursor that was just disrupted.
+  }
+  // the sprite clear ought take place within the alternate screen, if it's
+  // being used.
+  if(!(ret->flags & NCOPTION_NO_CLEAR_BITMAPS)){
+    if(sprite_clear_all(&ret->tcache, &ret->rstate.f)){
       goto err;
     }
   }
-  if(ret->smkx && term_emit("smkx", ret->smkx, ret->ttyfp, false)){
-    free_plane(ret->top);
-    goto err;
-  }
-  if((ret->rstate.mstreamfp = open_memstream(&ret->rstate.mstream, &ret->rstate.mstrsize)) == NULL){
-    free_plane(ret->top);
-    goto err;
-  }
-  ret->suppress_banner = opts->suppress_banner;
-  if(!opts->suppress_banner){
-    char prefixbuf[BPREFIXSTRLEN + 1];
-    term_fg_palindex(ret, ret->ttyfp, ret->colors <= 256 ? 50 % ret->colors : 0x20e080);
-    printf("\n notcurses %s by nick black et al", notcurses_version());
-    term_fg_palindex(ret, ret->ttyfp, ret->colors <= 256 ? 12 % ret->colors : 0x2080e0);
-    printf("\n  %d rows, %d columns (%sB), %d colors (%s)\n"
-          "  compiled with gcc-%s\n"
-          "  terminfo from %s\n",
-          ret->stdscr->leny, ret->stdscr->lenx,
-          bprefix(ret->stats.fbbytes, 1, prefixbuf, 0),
-          ret->colors, ret->RGBflag ? "direct" : "palette",
-          __VERSION__, curses_version());
-#ifdef USE_FFMPEG
-    printf("  avformat %u.%u.%u\n  avutil %u.%u.%u\n  swscale %u.%u.%u\n",
-          LIBAVFORMAT_VERSION_MAJOR, LIBAVFORMAT_VERSION_MINOR, LIBAVFORMAT_VERSION_MICRO,
-          LIBAVUTIL_VERSION_MAJOR, LIBAVUTIL_VERSION_MINOR, LIBAVUTIL_VERSION_MICRO,
-          LIBSWSCALE_VERSION_MAJOR, LIBSWSCALE_VERSION_MINOR, LIBSWSCALE_VERSION_MICRO);
-#else
-#ifdef USE_OIIO
-    printf("  openimageio %s\n", oiio_version());
-#else
-    term_fg_palindex(ret, ret->ttyfp, ret->colors <= 88 ? 1 % ret->colors : 0xcb);
-    fprintf(stderr, "\n Warning! Notcurses was built without multimedia support\n");
-#endif
-#endif
-    fflush(stdout);
-    term_fg_palindex(ret, ret->ttyfp, ret->colors <= 88 ? 1 % ret->colors : 0xcb);
-    if(!ret->RGBflag){ // FIXME
-      fprintf(stderr, "\n Warning! Colors subject to https://github.com/dankamongmen/notcurses/issues/4");
-      fprintf(stderr, "\n  Specify a (correct) TrueColor TERM, or COLORTERM=24bit.\n");
-    }else{
-      if(!ret->CCCflag){
-        fprintf(stderr, "\n Warning! Advertised TrueColor but no 'ccc' flag\n");
-      }
+  if(ret->rstate.f.used){
+    if(fbuf_flush(&ret->rstate.f, ret->ttyfp) < 0){
+      goto err;
     }
-    if(strcmp(encoding, "UTF-8")){ // it definitely exists, but could be ASCII
-      fprintf(stderr, "\n Warning! Encoding is not UTF-8.\n");
-    }
-  }
-  // flush on the switch to alternate screen, lest initial output be swept away
-  if(ret->smcup && term_emit("smcup", ret->smcup, ret->ttyfp, true)){
-    free_plane(ret->top);
-    goto err;
   }
   return ret;
 
-err:
-  // FIXME looks like we have some memory leaks on this error path?
-  tcsetattr(ret->ttyfd, TCSANOW, &ret->tpreserved);
-  free(ret);
-  return NULL;
-}
-
-void notcurses_drop_planes(notcurses* nc){
-  ncplane* p = nc->top;
-  while(p){
-    ncplane* tmp = p->z;
-    if(nc->stdscr == p){
-      nc->top = p;
-      p->z = NULL;
-    }else{
-      free_plane(p);
+err:{
+    void* altstack;
+    logpanic("alas, you will not be going to space today.");
+    notcurses_stop_minimal(ret, &altstack, -1);
+    fbuf_free(&ret->rstate.f);
+    if(ret->tcache.ttyfd >= 0 && ret->tcache.tpreserved){
+      (void)tcsetattr(ret->tcache.ttyfd, TCSAFLUSH, ret->tcache.tpreserved);
+      free(ret->tcache.tpreserved);
     }
-    p = tmp;
+    del_curterm(cur_term);
+    pthread_mutex_destroy(&ret->stats.lock);
+    pthread_mutex_destroy(&ret->pilelock);
+    free(ret);
+    free(altstack);
+    return NULL;
   }
 }
 
+// updates *pile to point at (*pile)->next, frees all but standard pile/plane
+static void
+ncpile_drop(notcurses* nc, ncpile** pile){
+  bool sawstdplane = false;
+  ncpile* next = (*pile)->next;
+  ncplane* p = (*pile)->top;
+  while(p){
+    ncplane* tmp = p->below;
+    logdebug("killing plane %p, next is %p", p, tmp);
+    if(nc->stdplane != p){
+      free_plane(p);
+    }else{
+      sawstdplane = true;
+    }
+    p = tmp;
+  }
+  *pile = next;
+  if(sawstdplane){
+    ncplane_pile(nc->stdplane)->top = nc->stdplane;
+    ncplane_pile(nc->stdplane)->bottom = nc->stdplane;
+    nc->stdplane->above = nc->stdplane->below = NULL;
+    nc->stdplane->blist = NULL;
+  }
+}
+
+// drop all piles and all planes, save the standard plane and its pile
+void notcurses_drop_planes(notcurses* nc){
+  logdebug("we have some planes");
+  pthread_mutex_lock(&nc->pilelock);
+  ncpile* p = ncplane_pile(nc->stdplane);
+  ncpile* p0 = p;
+  do{
+    ncpile_drop(nc, &p);
+  }while(p0 != p);
+  pthread_mutex_unlock(&nc->pilelock);
+  logdebug("all planes dropped");
+}
+
 int notcurses_stop(notcurses* nc){
+  logdebug("stopping notcurses");
+//notcurses_debug(nc, stderr);
   int ret = 0;
   if(nc){
-    ret |= notcurses_stop_minimal(nc);
-    while(nc->top){
-      ncplane* p = nc->top;
-      nc->top = p->z;
-      free_plane(p);
+    void* altstack;
+    ret |= notcurses_stop_minimal(nc, &altstack, 0);
+    // if we were not using the alternate screen, our cursor's wherever we last
+    // wrote. move it to the furthest place to which it advanced.
+    if(!get_escape(&nc->tcache, ESCAPE_SMCUP)){
+      fbuf_reset(&nc->rstate.f);
+//fprintf(stderr, "CLOSING TO %d/%d\n", nc->rstate.logendy, nc->rstate.logendx);
+      goto_location(nc, &nc->rstate.f, nc->rstate.logendy, nc->rstate.logendx, NULL);
+//fprintf(stderr, "***"); fflush(stderr);
+      fbuf_finalize(&nc->rstate.f, stdout);
     }
-    if(nc->rstate.mstreamfp){
-      fclose(nc->rstate.mstreamfp);
+    if(nc->stdplane){
+      notcurses_drop_planes(nc);
+      free_plane(nc->stdplane);
+    }
+    if(nc->tcache.ttyfd >= 0){
+      ret |= close(nc->tcache.ttyfd);
     }
     egcpool_dump(&nc->pool);
     free(nc->lastframe);
-    free(nc->rstate.mstream);
-    input_free_esctrie(&nc->inputescapes);
-    stash_stats(nc);
-    if(!nc->suppress_banner){
-      double avg = 0;
-      if(nc->stashstats.renders){
-        char totalbuf[BPREFIXSTRLEN + 1];
-        char minbuf[BPREFIXSTRLEN + 1];
-        char maxbuf[BPREFIXSTRLEN + 1];
-        char avgbuf[BPREFIXSTRLEN + 1];
-        avg = nc->stashstats.render_ns / (double)nc->stashstats.renders;
-        qprefix(nc->stashstats.render_ns, NANOSECS_IN_SEC, totalbuf, 0);
-        qprefix(nc->stashstats.render_min_ns, NANOSECS_IN_SEC, minbuf, 0);
-        qprefix(nc->stashstats.render_max_ns, NANOSECS_IN_SEC, maxbuf, 0);
-        qprefix(nc->stashstats.render_ns / nc->stashstats.renders, NANOSECS_IN_SEC, avgbuf, 0);
-        fprintf(stderr, "\n%ju render%s, %ss total (%ss min, %ss max, %ss avg)\n",
-                nc->stashstats.renders, nc->stashstats.renders == 1 ? "" : "s",
-                totalbuf, minbuf, maxbuf, avgbuf);
-        avg = nc->stashstats.render_bytes / (double)nc->stashstats.renders;
-        bprefix(nc->stashstats.render_bytes, 1, totalbuf, 0),
-        bprefix(nc->stashstats.render_min_bytes, 1, minbuf, 0),
-        bprefix(nc->stashstats.render_max_bytes, 1, maxbuf, 0),
-        fprintf(stderr, "%sB total (%sB min, %sB max, %.03gKiB avg)\n",
-                totalbuf, minbuf, maxbuf,
-                avg / 1024);
-      }
-      if(nc->stashstats.renders || nc->stashstats.failed_renders){
-        fprintf(stderr, "%.1f theoretical FPS, %ju failed render%s\n",
-                nc->stashstats.renders ?
-                  NANOSECS_IN_SEC * (double)nc->stashstats.renders / nc->stashstats.render_ns : 0.0,
-                nc->stashstats.failed_renders,
-                nc->stashstats.failed_renders == 1 ? "" : "s");
-        fprintf(stderr, "RGB emits:elides: def %ju:%ju fg %ju:%ju bg %ju:%ju\n",
-                nc->stashstats.defaultemissions,
-                nc->stashstats.defaultelisions,
-                nc->stashstats.fgemissions,
-                nc->stashstats.fgelisions,
-                nc->stashstats.bgemissions,
-                nc->stashstats.bgelisions);
-        fprintf(stderr, " Elide rates: %.2f%% %.2f%% %.2f%%\n",
-                (nc->stashstats.defaultemissions + nc->stashstats.defaultelisions) == 0 ? 0 :
-                (nc->stashstats.defaultelisions * 100.0) / (nc->stashstats.defaultemissions + nc->stashstats.defaultelisions),
-                (nc->stashstats.fgemissions + nc->stashstats.fgelisions) == 0 ? 0 :
-                (nc->stashstats.fgelisions * 100.0) / (nc->stashstats.fgemissions + nc->stashstats.fgelisions),
-                (nc->stashstats.bgemissions + nc->stashstats.bgelisions) == 0 ? 0 :
-                (nc->stashstats.bgelisions * 100.0) / (nc->stashstats.bgemissions + nc->stashstats.bgelisions));
-        fprintf(stderr, "Cell emits:elides: %ju/%ju (%.2f%%)\n",
-                nc->stashstats.cellemissions, nc->stashstats.cellelisions,
-                (nc->stashstats.cellemissions + nc->stashstats.cellelisions) == 0 ? 0 :
-                (nc->stashstats.cellelisions * 100.0) / (nc->stashstats.cellemissions + nc->stashstats.cellelisions));
-      }
+    // perhaps surprisingly, this stops the input thread
+    free_terminfo_cache(&nc->tcache);
+    // get any current stats loaded into stash_stats
+    notcurses_stats_reset(nc, NULL);
+    if(!(nc->flags & NCOPTION_SUPPRESS_BANNERS)){
+      summarize_stats(nc);
     }
+#ifndef __MINGW32__
+    del_curterm(cur_term);
+#endif
+    ret |= pthread_mutex_destroy(&nc->stats.lock);
+    ret |= pthread_mutex_destroy(&nc->pilelock);
+    fbuf_free(&nc->rstate.f);
     free(nc);
+    free(altstack);
   }
   return ret;
 }
 
 uint64_t ncplane_channels(const ncplane* n){
-  return n->channels;
+  return ncchannels_channels(n->channels);
 }
 
-uint32_t ncplane_attr(const ncplane* n){
-  return n->attrword;
+void ncplane_set_channels(ncplane* n, uint64_t channels){
+  ncchannels_set_channels(&n->channels, channels);
+}
+
+uint16_t ncplane_styles(const ncplane* n){
+  return n->stylemask;
 }
 
 void ncplane_set_fg_default(ncplane* n){
-  channels_set_fg_default(&n->channels);
+  ncchannels_set_fg_default(&n->channels);
 }
 
 void ncplane_set_bg_default(ncplane* n){
-  channels_set_bg_default(&n->channels);
+  ncchannels_set_bg_default(&n->channels);
 }
 
-void ncplane_set_bg_rgb_clipped(ncplane* n, int r, int g, int b){
-  channels_set_bg_rgb_clipped(&n->channels, r, g, b);
+void ncplane_set_bg_rgb8_clipped(ncplane* n, int r, int g, int b){
+  ncchannels_set_bg_rgb8_clipped(&n->channels, r, g, b);
 }
 
-int ncplane_set_bg_rgb(ncplane* n, int r, int g, int b){
-  return channels_set_bg_rgb(&n->channels, r, g, b);
+int ncplane_set_bg_rgb8(ncplane* n, unsigned r, unsigned g, unsigned b){
+  return ncchannels_set_bg_rgb8(&n->channels, r, g, b);
 }
 
-void ncplane_set_fg_rgb_clipped(ncplane* n, int r, int g, int b){
-  channels_set_fg_rgb_clipped(&n->channels, r, g, b);
+void ncplane_set_fg_rgb8_clipped(ncplane* n, int r, int g, int b){
+  ncchannels_set_fg_rgb8_clipped(&n->channels, r, g, b);
 }
 
-int ncplane_set_fg_rgb(ncplane* n, int r, int g, int b){
-  return channels_set_fg_rgb(&n->channels, r, g, b);
+int ncplane_set_fg_rgb8(ncplane* n, unsigned r, unsigned g, unsigned b){
+  return ncchannels_set_fg_rgb8(&n->channels, r, g, b);
 }
 
-int ncplane_set_fg(ncplane* n, unsigned channel){
-  return channels_set_fg(&n->channels, channel);
+int ncplane_set_fg_rgb(ncplane* n, unsigned channel){
+  return ncchannels_set_fg_rgb(&n->channels, channel);
 }
 
-int ncplane_set_bg(ncplane* n, unsigned channel){
-  return channels_set_bg(&n->channels, channel);
+uint64_t ncplane_set_bchannel(ncplane* n, uint32_t channel){
+  return ncchannels_set_bchannel(&n->channels, channel);
+}
+
+uint64_t ncplane_set_fchannel(ncplane* n, uint32_t channel){
+  return ncchannels_set_fchannel(&n->channels, channel);
+}
+
+int ncplane_set_bg_rgb(ncplane* n, unsigned channel){
+  return ncchannels_set_bg_rgb(&n->channels, channel);
 }
 
 int ncplane_set_fg_alpha(ncplane* n, int alpha){
-  return channels_set_fg_alpha(&n->channels, alpha);
+  return ncchannels_set_fg_alpha(&n->channels, alpha);
 }
 
 int ncplane_set_bg_alpha(ncplane *n, int alpha){
-  return channels_set_bg_alpha(&n->channels, alpha);
+  return ncchannels_set_bg_alpha(&n->channels, alpha);
 }
 
-int ncplane_set_fg_palindex(ncplane* n, int idx){
-  if(idx < 0 || idx >= NCPALETTESIZE){
+int ncplane_set_fg_palindex(ncplane* n, unsigned idx){
+  return ncchannels_set_fg_palindex(&n->channels, idx);
+}
+
+int ncplane_set_bg_palindex(ncplane* n, unsigned idx){
+  return ncchannels_set_bg_palindex(&n->channels, idx);
+}
+
+int ncplane_set_base_cell(ncplane* ncp, const nccell* c){
+  if(nccell_wide_right_p(c)){
     return -1;
   }
-  n->channels |= CELL_FGDEFAULT_MASK;
-  n->channels |= CELL_FG_PALETTE;
-  n->channels &= ~(CELL_ALPHA_MASK << 32u);
-  n->attrword &= 0xffff00ff;
-  n->attrword |= (idx << 8u);
-  return 0;
+  return nccell_duplicate(ncp, &ncp->basecell, c);
 }
 
-int ncplane_set_bg_palindex(ncplane* n, int idx){
-  if(idx < 0 || idx >= NCPALETTESIZE){
-    return -1;
+int ncplane_set_base(ncplane* ncp, const char* egc, uint16_t stylemask, uint64_t channels){
+  return nccell_prime(ncp, &ncp->basecell, egc, stylemask, channels);
+}
+
+int ncplane_base(ncplane* ncp, nccell* c){
+  return nccell_duplicate(ncp, c, &ncp->basecell);
+}
+
+const char* nccell_extended_gcluster(const ncplane* n, const nccell* c){
+  if(cell_simple_p(c)){
+    return (const char*)&c->gcluster;
   }
-  n->channels |= CELL_BGDEFAULT_MASK;
-  n->channels |= CELL_BG_PALETTE;
-  n->channels &= ~CELL_ALPHA_MASK;
-  n->attrword &= 0xffffff00;
-  n->attrword |= idx;
-  return 0;
-}
-
-int ncplane_set_base_cell(ncplane* ncp, const cell* c){
-  return cell_duplicate(ncp, &ncp->basecell, c);
-}
-
-int ncplane_set_base(ncplane* ncp, const char* egc, uint32_t attrword, uint64_t channels){
-  return cell_prime(ncp, &ncp->basecell, egc, attrword, channels);
-}
-
-int ncplane_base(ncplane* ncp, cell* c){
-  return cell_duplicate(ncp, c, &ncp->basecell);
-}
-
-const char* cell_extended_gcluster(const ncplane* n, const cell* c){
-  return extended_gcluster(n, c);
+  return egcpool_extended_gcluster(&n->pool, c);
 }
 
 // 'n' ends up above 'above'
-int ncplane_move_above_unsafe(ncplane* restrict n, ncplane* restrict above){
-  if(n->z == above){
+int ncplane_move_above(ncplane* restrict n, ncplane* restrict above){
+  if(n == above){ // probably gets optimized out =/
+    return -1;
+  }
+  ncpile* p = ncplane_pile(n);
+  if(above == NULL){
+    if(n->below){
+      if( (n->below->above = n->above) ){
+        n->above->below = n->below;
+      }else{
+        p->top = n->below;
+      }
+      n->below = NULL;
+      if( (n->above = p->bottom) ){
+        n->above->below = n;
+      }
+      p->bottom = n;
+    }
     return 0;
   }
-  ncplane** an = find_above_ncplane(n);
-  if(an == NULL){
-    return -1;
+  if(n->below != above){
+    if(p != ncplane_pile(above)){ // can't move among piles
+      return -1;
+    }
+    // splice out 'n'
+    if(n->below){
+      n->below->above = n->above;
+    }else{
+      p->bottom = n->above;
+    }
+    if(n->above){
+      n->above->below = n->below;
+    }else{
+      p->top = n->below;
+    }
+    if( (n->above = above->above) ){
+      above->above->below = n;
+    }else{
+      p->top = n;
+    }
+    above->above = n;
+    n->below = above;
   }
-  ncplane** aa = find_above_ncplane(above);
-  if(aa == NULL){
-    return -1;
-  }
-  *an = n->z; // splice n out
-  n->z = above; // attach above below n
-  *aa = n; // spline n in above
   return 0;
 }
 
-// 'n' ends up below 'below'
-int ncplane_move_below_unsafe(ncplane* restrict n, ncplane* restrict below){
-  if(below->z == n){
+// 'n' ends up below 'below', or on top if 'below' == NULL
+int ncplane_move_below(ncplane* restrict n, ncplane* restrict below){
+  if(n == below){ // probably gets optimized out =/
+    return -1;
+  }
+  ncpile* p = ncplane_pile(n);
+  if(below == NULL){
+    if(n->above){
+      if( (n->above->below = n->below) ){
+        n->below->above = n->above;
+      }else{
+        p->bottom = n->above;
+      }
+      n->above = NULL;
+      if( (n->below = p->top) ){
+        n->below->above = n;
+      }
+      p->top = n;
+    }
     return 0;
   }
-  ncplane** an = find_above_ncplane(n);
-  if(an == NULL){
-    return -1;
+  if(n->above != below){
+    if(p != ncplane_pile(below)){ // can't move among piles
+      return -1;
+    }
+    if(n->below){
+      n->below->above = n->above;
+    }else{
+      p->bottom = n->above;
+    }
+    if(n->above){
+      n->above->below = n->below;
+    }else{
+      p->top = n->below;
+    }
+    if( (n->below = below->below) ){
+      below->below->above = n;
+    }else{
+      p->bottom = n;
+    }
+    below->below = n;
+    n->above = below;
   }
-  *an = n->z; // splice n out
-  n->z = below->z; // reattach subbelow list to n
-  below->z = n; // splice n in below
   return 0;
 }
 
-int ncplane_move_top(ncplane* n){
-  ncplane** an = find_above_ncplane(n);
-  if(an == NULL){
+// if above is NULL, we're moving to the bottom
+int ncplane_move_family_above(ncplane* restrict n, ncplane* restrict bpoint){
+  ncplane* above = ncplane_above(n);
+  ncplane* below = ncplane_below(n);
+  if(ncplane_move_above(n, bpoint)){
     return -1;
   }
-  *an = n->z; // splice n out
-  n->z = n->nc->top;
-  n->nc->top = n;
+  // traverse the planes above n, until we hit NULL. do the planes above n
+  // first, so that we know the topmost element of our new ensplicification.
+  // at this point, n is the bottommost plane, and we're inserting above it.
+  ncplane* targ = n;
+  while(above && above != n){
+    ncplane* tmp = ncplane_above(above);
+    if(ncplane_descendant_p(above, n)){
+      ncplane_move_above(above, targ);
+      targ = above;
+    }
+    above = tmp;
+  }
+  // n remains the topmost plane, and we're inserting above it. we have to be
+  // careful this time not to cross into any we moved below n.
+  const ncplane* topmost = targ;
+  targ = n;
+  while(below && below != topmost){
+    ncplane* tmp = ncplane_below(below);
+    if(ncplane_descendant_p(below, n)){
+      ncplane_move_below(below, targ);
+      targ = below;
+    }
+    below = tmp;
+  }
   return 0;
 }
 
-int ncplane_move_bottom(ncplane* n){
-  ncplane** an = find_above_ncplane(n);
-  if(an == NULL){
+// if below is NULL, we're moving to the top
+int ncplane_move_family_below(ncplane* restrict n, ncplane* restrict bpoint){
+  ncplane* below = ncplane_below(n);
+  ncplane* above = ncplane_above(n);
+  if(ncplane_move_below(n, bpoint)){
     return -1;
   }
-  *an = n->z; // splice n out
-  an = &n->nc->top;
-  while(*an){
-    an = &(*an)->z;
+  // traverse the planes below n, until we hit NULL. do the planes below n
+  // first, so that we know the bottommost element of our new ensplicification.
+  // we're inserting below n...
+  ncplane* targ = n;
+  while(below && below != n){
+    ncplane* tmp = ncplane_below(below);
+    if(ncplane_descendant_p(below, n)){
+      ncplane_move_below(below, targ);
+      targ = below;
+    }
+    below = tmp;
   }
-  *an = n;
-  n->z = NULL;
+  // n remains the topmost plane, and we're inserting above it. we have to be
+  // careful this time not to cross into any we moved below n.
+  const ncplane* bottommost = targ;
+  targ = n;
+  while(above && above != bottommost){
+    ncplane* tmp = ncplane_above(above);
+    if(ncplane_descendant_p(above, n)){
+      ncplane_move_above(above, targ);
+      targ = above;
+    }
+    above = tmp;
+  }
   return 0;
 }
 
-void ncplane_cursor_yx(const ncplane* n, int* y, int* x){
+void ncplane_cursor_yx(const ncplane* n, unsigned* y, unsigned* x){
   if(y){
     *y = n->y;
   }
@@ -1215,217 +1751,347 @@ void ncplane_cursor_yx(const ncplane* n, int* y, int* x){
 }
 
 static inline void
-cell_obliterate(ncplane* n, cell* c){
-  cell_release(n, c);
-  cell_init(c);
+nccell_obliterate(ncplane* n, nccell* c){
+  nccell_release(n, c);
+  nccell_init(c);
 }
 
-// increment y by 1 and rotate the framebuffer up one line. x moves to 0.
-static inline void
-scroll_down(ncplane* n){
+// increment y by 1 and rotate the framebuffer up one line. x moves to 0. any
+// non-fixed bound planes move up 1 line if they intersect the plane.
+void scroll_down(ncplane* n){
+//fprintf(stderr, "pre-scroll: %d/%d %d/%d log: %d scrolling: %u\n", n->y, n->x, n->leny, n->lenx, n->logrow, n->scrolling);
   n->x = 0;
   if(n->y == n->leny - 1){
+    // we're on the last line of the plane
+    if(n->autogrow){
+      ncplane_resize_simple(n, n->leny + 1, n->lenx);
+      ncplane_cursor_move_yx(n, n->leny - 1, 0);
+      return;
+    }
+    // we'll actually be scrolling material up and out, and making a new line.
+    // if this is the standard plane, that means a "physical" scroll event is
+    // called for.
+    if(n == notcurses_stdplane(ncplane_notcurses(n))){
+      ncplane_pile(n)->scrolls++;
+    }
     n->logrow = (n->logrow + 1) % n->leny;
-    cell* row = n->fb + nfbcellidx(n, n->y, 0);
-    for(int clearx = 0 ; clearx < n->lenx ; ++clearx){
-      cell_release(n, &row[clearx]);
+    nccell* row = n->fb + nfbcellidx(n, n->y, 0);
+    for(unsigned clearx = 0 ; clearx < n->lenx ; ++clearx){
+      nccell_release(n, &row[clearx]);
     }
     memset(row, 0, sizeof(*row) * n->lenx);
+    for(struct ncplane* c = n->blist ; c ; c = c->bnext){
+      if(!c->fixedbound){
+        if(ncplanes_intersect_p(n, c)){
+          ncplane_move_rel(c, -1, 0);
+        }
+      }
+    }
   }else{
     ++n->y;
   }
 }
 
-int ncplane_putc_yx(ncplane* n, int y, int x, const cell* c){
-  // if scrolling is enabled, check *before ncplane_cursor_move_yx()* whether
-  // we're past the end of the line, and move to the next line if so.
-  bool wide = cell_double_wide_p(c);
-  if(x == -1 && y == -1 && n->x + wide >= n->lenx){
-    if(!n->scrolling){
-      return -1;
-    }
+int ncplane_scrollup(ncplane* n, int r){
+  if(!ncplane_scrolling_p(n)){
+    logerror("can't scroll %d on non-scrolling plane", r);
+    return -1;
+  }
+  if(r < 0){
+    logerror("can't scroll %d lines", r);
+    return -1;
+  }
+  while(r-- > 0){
     scroll_down(n);
   }
-  if(ncplane_cursor_move_yx(n, y, x)){
-    return -1;
-  }
-  if(c->gcluster == '\n'){
-    if(n->scrolling){
-      scroll_down(n);
-      return 0;
-    }
-  }
-  // A wide character obliterates anything to its immediate right (and marks
-  // that cell as wide). Any character placed atop one half of a wide character
-  // obliterates the other half. Note that a wide char can thus obliterate two
-  // wide chars, totalling four columns.
-  cell* targ = &n->fb[nfbcellidx(n, n->y, n->x)];
-  if(n->x > 0){
-    if(cell_double_wide_p(targ)){ // replaced cell is half of a wide char
-      if(targ->gcluster == 0){ // we're the right half
-        cell_obliterate(n, &n->fb[nfbcellidx(n, n->y, n->x - 1)]);
-      }else{
-        cell_obliterate(n, &n->fb[nfbcellidx(n, n->y, n->x + 1)]);
-      }
-    }
-  }
-  if(cell_duplicate(n, targ, c) < 0){
-    return -1;
-  }
-  int cols = 1;
-  if(wide){ // must set our right wide, and check for further damage
-    ++cols;
-    if(n->x < n->lenx - 1){ // check to our right
-      cell* candidate = &n->fb[nfbcellidx(n, n->y, n->x + 1)];
-      if(n->x < n->lenx - 2){
-        if(cell_wide_left_p(candidate)){
-          cell_obliterate(n, &n->fb[nfbcellidx(n, n->y, n->x + 2)]);
-        }
-      }
-      cell_obliterate(n, candidate);
-      cell_set_wide(candidate);
-      candidate->channels = c->channels;
-    }
-  }
-  n->x += cols;
-  return cols;
-}
-
-int ncplane_putegc_yx(ncplane* n, int y, int x, const char* gclust, int* sbytes){
-  cell c = CELL_TRIVIAL_INITIALIZER;
-  int primed = cell_prime(n, &c, gclust, n->attrword, n->channels);
-  if(sbytes){
-    *sbytes = primed;
-  }
-  if(primed < 0){
-    return -1;
-  }
-  int ret = ncplane_putc_yx(n, y, x, &c);
-  cell_release(n, &c);
-  return ret;
-}
-
-int ncplane_putsimple_stainable(ncplane* n, char c){
-  uint64_t channels = n->channels;
-  uint32_t attrword = n->attrword;
-  const cell* targ = &n->fb[nfbcellidx(n, n->y, n->x)];
-  n->channels = targ->channels;
-  n->attrword = targ->attrword;
-  int ret = ncplane_putsimple(n, c);
-  n->channels = channels;
-  n->attrword = attrword;
-  return ret;
-}
-
-int ncplane_putwegc_stainable(ncplane* n, const wchar_t* gclust, int* sbytes){
-  uint64_t channels = n->channels;
-  uint32_t attrword = n->attrword;
-  const cell* targ = &n->fb[nfbcellidx(n, n->y, n->x)];
-  n->channels = targ->channels;
-  n->attrword = targ->attrword;
-  int ret = ncplane_putwegc(n, gclust, sbytes);
-  n->channels = channels;
-  n->attrword = attrword;
-  return ret;
-}
-
-int ncplane_putegc_stainable(ncplane* n, const char* gclust, int* sbytes){
-  uint64_t channels = n->channels;
-  uint32_t attrword = n->attrword;
-  const cell* targ = &n->fb[nfbcellidx(n, n->y, n->x)];
-  n->channels = targ->channels;
-  n->attrword = targ->attrword;
-  int ret = ncplane_putegc(n, gclust, sbytes);
-  n->channels = channels;
-  n->attrword = attrword;
-  return ret;
-}
-
-int ncplane_cursor_at(const ncplane* n, cell* c, char** gclust){
-  if(n->y == n->leny && n->x == n->lenx){
-    return -1;
-  }
-  const cell* src = &n->fb[nfbcellidx(n, n->y, n->x)];
-  memcpy(c, src, sizeof(*src));
-  *gclust = NULL;
-  if(!cell_simple_p(src)){
-    *gclust = strdup(extended_gcluster(n, src));
-    if(*gclust == NULL){
-      return -1;
-    }
+  if(n == notcurses_stdplane(ncplane_notcurses(n))){
+    notcurses_render(ncplane_notcurses(n));
   }
   return 0;
 }
 
-int cell_load(ncplane* n, cell* c, const char* gcluster){
-  int bytes;
-  int cols;
-  if((bytes = utf8_egc_len(gcluster, &cols)) >= 0 && bytes <= 1){
-    cell_release(n, c);
-    c->channels &= ~CELL_WIDEASIAN_MASK;
-    c->gcluster = *gcluster;
-    return !!c->gcluster;
-  }
-  if(cols > 1){
-    c->channels |= CELL_WIDEASIAN_MASK;
-  }else{
-    c->channels &= ~CELL_WIDEASIAN_MASK;
-  }
-  if(!cell_simple_p(c)){
-    if(strcmp(gcluster, cell_extended_gcluster(n, c)) == 0){
-      return bytes; // reduce, reuse, recycle
-    }else{
-      cell_release(n, c);
-    }
-  }
-  int eoffset = egcpool_stash(&n->pool, gcluster, bytes);
-  if(eoffset < 0){
+// Scroll |n| up until |child| is no longer hidden beneath it. Returns an
+// error if |child| is not a child of |n|, or |n| is not scrolling, or |child|
+// is fixed. Returns the number of scrolling events otherwise (might be 0).
+int ncplane_scrollup_child(ncplane* n, const ncplane* child){
+  if(!ncplane_descendant_p(child, n)){
+    logerror("not a descendant of specified plane");
     return -1;
   }
-  c->gcluster = eoffset + 0x80;
-  return bytes;
+  if(child->fixedbound){
+    logerror("child plane is fixed");
+    return -1;
+  }
+  int parend = ncplane_abs_y(n) + ncplane_dim_y(n) - 1; // where parent ends
+  int chend = ncplane_abs_y(child) + ncplane_dim_y(child) - 1; // where child ends
+  if(chend <= parend){
+    return 0;
+  }
+  int r = chend - parend; // how many rows we need scroll parent
+  ncplane_cursor_move_yx(n, ncplane_dim_y(n) - 1, 0);
+  int ret = ncplane_scrollup(n, r);
+  return ret;
 }
 
-unsigned notcurses_supported_styles(const notcurses* nc){
-  unsigned styles = 0;
-  styles |= nc->standout ? NCSTYLE_STANDOUT : 0;
-  styles |= nc->uline ? NCSTYLE_UNDERLINE : 0;
-  styles |= nc->reverse ? NCSTYLE_REVERSE : 0;
-  styles |= nc->blink ? NCSTYLE_BLINK : 0;
-  styles |= nc->dim ? NCSTYLE_DIM : 0;
-  styles |= nc->bold ? NCSTYLE_BOLD : 0;
-  styles |= nc->italics ? NCSTYLE_ITALIC : 0;
-  return styles;
+int nccell_load(ncplane* n, nccell* c, const char* gcluster){
+  int cols;
+  int bytes = utf8_egc_len(gcluster, &cols);
+  return pool_load_direct(&n->pool, c, gcluster, bytes, cols);
 }
 
-int notcurses_palette_size(const notcurses* nc){
-  return nc->colors;
+// where the magic happens. write the single EGC completely described by |egc|,
+// occupying |cols| columns, to the ncplane |n| at the coordinate |y|, |x|. if
+// either or both of |y|/|x| is -1, the current cursor location for that
+// dimension will be used. if the glyph cannot fit on the current line, it is
+// an error unless scrolling is enabled.
+static int
+ncplane_put(ncplane* n, int y, int x, const char* egc, int cols,
+            uint16_t stylemask, uint64_t channels, int bytes){
+  if(n->sprite){
+    logerror("can't write [%s] to sprixelated plane", egc);
+    return -1;
+  }
+  // reject any control character for output other than newline (and then only
+  // on a scrolling plane) and tab.
+  if(is_control_egc((const unsigned char*)egc, bytes)){
+    if(*egc == '\n'){
+      // if we're not scrolling, autogrow would be to the right (as opposed to
+      // down), and thus it still wouldn't apply to the case of a newline.
+      if(!n->scrolling){
+        logerror("rejecting newline on non-scrolling plane");
+        return -1;
+      }
+    }else if(*egc != '\t'){
+      logerror("rejecting %dB control character", bytes);
+      return -1;
+    }
+  }
+  // check *before ncplane_cursor_move_yx()* whether we're past the end of the
+  // line. if scrolling is enabled, move to the next line if so. if x or y are
+  // specified, we must always try to print at exactly that location, and
+  // there's no need to check the present location in that dimension.
+  bool linesend = false;
+  if(x < 0){
+    // we checked x for all negatives, but only -1 is valid (our else clause is
+    // predicated on a non-negative x).
+    if(x == -1){
+      if(n->x + cols - 1 >= n->lenx){
+        linesend = true;
+      }
+    }
+  }else{
+    if((unsigned)x + cols - 1 >= n->lenx){
+      linesend = true;
+    }
+  }
+  bool scrolled = false;
+  if(linesend){
+    if(n->scrolling){
+      scroll_down(n);
+      scrolled = true;
+    }else if(n->autogrow){
+      ncplane_resize_simple(n, n->leny, n->lenx + cols);
+    }else{
+      logerror("target x %d [%.*s] > length %d", n->x, bytes, egc, n->lenx);
+      return -1;
+    }
+  }
+  // targets outside the plane will be rejected here.
+  if(ncplane_cursor_move_yx(n, y, x)){
+    return -1;
+  }
+  if(*egc == '\n'){
+    scroll_down(n);
+    scrolled = true;
+  }
+  // A wide character obliterates anything to its immediate right (and marks
+  // that cell as wide). Any character placed atop one cell of a wide character
+  // obliterates all cells. Note that a two-cell glyph can thus obliterate two
+  // other two-cell glyphs, totalling four columns.
+  nccell* targ = ncplane_cell_ref_yx(n, n->y, n->x);
+  // we're always starting on the leftmost cell of our output glyph. check the
+  // target, and find the leftmost cell of the glyph it will be displacing.
+  // obliterate as we go along.
+  int idx = n->x;
+  nccell* lmc = targ;
+  while(nccell_wide_right_p(lmc)){
+    nccell_obliterate(n, &n->fb[nfbcellidx(n, n->y, idx)]);
+    lmc = ncplane_cell_ref_yx(n, n->y, --idx);
+  }
+  // we're now on the leftmost cell of the target glyph.
+  int twidth = nccell_cols(lmc);
+  nccell_release(n, lmc);
+  twidth -= n->x - idx;
+  while(--twidth > 0){
+    nccell_obliterate(n, &n->fb[nfbcellidx(n, n->y, n->x + twidth)]);
+  }
+  targ->stylemask = stylemask;
+  targ->channels = channels;
+  // tabs get replaced with spaces, up to the next tab stop. we always try to
+  // write at least one. if there are no more tabstops on the current line, if
+  // autogrowing to the right, extend as necessary. otherwise, if scrolling,
+  // move to the next line. otherwise, simply fill any spaces we can. this has
+  // already taken place by the time we get here, if it ought have happened.
+  if(*egc == '\t'){
+    cols = TABSTOP - (n->x % TABSTOP);
+    if(n->x + 1 >= n->lenx){
+      if(!n->scrolling && n->autogrow){
+        ncplane_resize_simple(n, n->leny, n->lenx + (cols ? cols - 1 : TABSTOP - 1));
+        // must refresh targ; resize invalidated it
+        targ = ncplane_cell_ref_yx(n, n->y, n->x);
+      }
+    }
+    if(cell_load_direct(n, targ, " ", bytes, 1) < 0){
+      return -1;
+    }
+  }else{
+    if(cell_load_direct(n, targ, egc, bytes, cols) < 0){
+      return -1;
+    }
+  }
+  //loginfo("%08x %016lx %c %d %d", targ->gcluster, targ->channels, nccell_double_wide_p(targ) ? 'D' : 'd', bytes, cols);
+  if(*egc != '\n'){
+    ++n->x;
+    // if wide, set our right hand columns wide, and check for further damage
+    for(int i = 1 ; i < cols ; ++i){
+      nccell* candidate = &n->fb[nfbcellidx(n, n->y, n->x)];
+      int off = nccell_cols(candidate);
+      nccell_release(n, &n->fb[nfbcellidx(n, n->y, n->x)]);
+      while(--off > 0){
+        nccell_obliterate(n, &n->fb[nfbcellidx(n, n->y, n->x + off)]);
+      }
+      if(*egc != '\t'){
+        candidate->channels = targ->channels;
+        candidate->stylemask = targ->stylemask;
+        candidate->width = targ->width;
+      }else{
+        if(cell_load_direct(n, candidate, " ", bytes, 1) < 0){
+          return -1;
+        }
+      }
+      // don't do any further expansion of the plane here; just break
+      if(++n->x >= n->lenx){
+        break;
+      }
+    }
+  }
+  if(scrolled){
+    if(n == notcurses_stdplane(ncplane_notcurses(n))){
+      notcurses_render(ncplane_notcurses(n));
+    }
+  }
+  return cols;
+}
+
+int ncplane_putc_yx(ncplane* n, int y, int x, const nccell* c){
+  const int cols = nccell_cols(c);
+  // unfortunately, |c| comes from |n|. the act of writing |c| to |n| could
+  // grow |n|'s egcpool, invalidating the reference represented by
+  // nccell_extended_gcluster(). so we must copy and free it.
+  char* egc = nccell_strdup(n, c);
+  if(egc == NULL){
+    logerror("couldn't duplicate cell");
+    return -1;
+  }
+  int r = ncplane_put(n, y, x, egc, cols, c->stylemask, c->channels, strlen(egc));
+  free(egc);
+  return r;
+}
+
+int ncplane_putegc_yx(ncplane* n, int y, int x, const char* gclust, size_t* sbytes){
+  int cols;
+  int bytes = utf8_egc_len(gclust, &cols);
+  if(bytes < 0){
+    return -1;
+  }
+  if(sbytes){
+    *sbytes = bytes;
+  }
+//fprintf(stderr, "glust: %s cols: %d wcs: %d\n", gclust, cols, bytes);
+  return ncplane_put(n, y, x, gclust, cols, n->stylemask, n->channels, bytes);
+}
+
+int ncplane_putchar_stained(ncplane* n, char c){
+  uint64_t channels = n->channels;
+  uint16_t stylemask = n->stylemask;
+  const nccell* targ = &n->fb[nfbcellidx(n, n->y, n->x)];
+  n->channels = targ->channels;
+  n->stylemask = targ->stylemask;
+  int ret = ncplane_putchar(n, c);
+  n->channels = channels;
+  n->stylemask = stylemask;
+  return ret;
+}
+
+int ncplane_putwegc_stained(ncplane* n, const wchar_t* gclust, size_t* sbytes){
+  uint64_t channels = n->channels;
+  uint16_t stylemask = n->stylemask;
+  const nccell* targ = &n->fb[nfbcellidx(n, n->y, n->x)];
+  n->channels = targ->channels;
+  n->stylemask = targ->stylemask;
+  int ret = ncplane_putwegc(n, gclust, sbytes);
+  n->channels = channels;
+  n->stylemask = stylemask;
+  return ret;
+}
+
+int ncplane_putegc_stained(ncplane* n, const char* gclust, size_t* sbytes){
+  uint64_t channels = n->channels;
+  uint16_t stylemask = n->stylemask;
+  const nccell* targ = &n->fb[nfbcellidx(n, n->y, n->x)];
+  n->channels = targ->channels;
+  n->stylemask = targ->stylemask;
+  int ret = ncplane_putegc(n, gclust, sbytes);
+  n->channels = channels;
+  n->stylemask = stylemask;
+  return ret;
+}
+
+int ncplane_cursor_at(const ncplane* n, nccell* c, char** gclust){
+  if(n->y >= n->leny || n->x >= n->lenx){
+    return -1;
+  }
+  const nccell* src = &n->fb[nfbcellidx(n, n->y, n->x)];
+  memcpy(c, src, sizeof(*src));
+  if(cell_simple_p(c)){
+    *gclust = NULL;
+  }else if((*gclust = strdup(nccell_extended_gcluster(n, src))) == NULL){
+    return -1;
+  }
+  return 0;
+}
+
+uint16_t notcurses_supported_styles(const notcurses* nc){
+  return term_supported_styles(&nc->tcache);
+}
+
+unsigned notcurses_palette_size(const notcurses* nc){
+  return nc->tcache.caps.colors;
+}
+
+char* notcurses_detected_terminal(const notcurses* nc){
+  return termdesc_longterm(&nc->tcache);
+}
+
+// conform to the specified stylebits
+void ncplane_set_styles(ncplane* n, unsigned stylebits){
+  n->stylemask = (stylebits & NCSTYLE_MASK);
 }
 
 // turn on any specified stylebits
-void ncplane_styles_on(ncplane* n, unsigned stylebits){
-  n->attrword |= (stylebits & NCSTYLE_MASK);
+void ncplane_on_styles(ncplane* n, unsigned stylebits){
+  n->stylemask |= (stylebits & NCSTYLE_MASK);
 }
 
 // turn off any specified stylebits
-void ncplane_styles_off(ncplane* n, unsigned stylebits){
-  n->attrword &= ~(stylebits & NCSTYLE_MASK);
-}
-
-// set the current stylebits to exactly those provided
-void ncplane_styles_set(ncplane* n, unsigned stylebits){
-  n->attrword = (n->attrword & ~NCSTYLE_MASK) | ((stylebits & NCSTYLE_MASK));
-}
-
-unsigned ncplane_styles(const ncplane* n){
-  return (n->attrword & NCSTYLE_MASK);
+void ncplane_off_styles(ncplane* n, unsigned stylebits){
+  n->stylemask &= ~(stylebits & NCSTYLE_MASK);
 }
 
 // i hate the big allocation and two copies here, but eh what you gonna do?
 // well, for one, we don't need the huge allocation FIXME
-static char*
-ncplane_vprintf_prep(ncplane* n, const char* format, va_list ap){
-  const size_t size = n->lenx + 1; // healthy estimate, can embiggen below
+char* ncplane_vprintf_prep(const char* format, va_list ap){
+  const size_t size = BUFSIZ; // healthy estimate, can embiggen below
   char* buf = malloc(size);
   if(buf == NULL){
     return NULL;
@@ -1453,7 +2119,7 @@ ncplane_vprintf_prep(ncplane* n, const char* format, va_list ap){
 }
 
 int ncplane_vprintf_yx(ncplane* n, int y, int x, const char* format, va_list ap){
-  char* r = ncplane_vprintf_prep(n, format, ap);
+  char* r = ncplane_vprintf_prep(format, ap);
   if(r == NULL){
     return -1;
   }
@@ -1464,7 +2130,7 @@ int ncplane_vprintf_yx(ncplane* n, int y, int x, const char* format, va_list ap)
 
 int ncplane_vprintf_aligned(ncplane* n, int y, ncalign_e align,
                             const char* format, va_list ap){
-  char* r = ncplane_vprintf_prep(n, format, ap);
+  char* r = ncplane_vprintf_prep(format, ap);
   if(r == NULL){
     return -1;
   }
@@ -1473,18 +2139,39 @@ int ncplane_vprintf_aligned(ncplane* n, int y, ncalign_e align,
   return ret;
 }
 
-int ncplane_hline_interp(ncplane* n, const cell* c, int len,
+int ncplane_vprintf_stained(struct ncplane* n, const char* format, va_list ap){
+  char* r = ncplane_vprintf_prep(format, ap);
+  if(r == NULL){
+    return -1;
+  }
+  int ret = ncplane_putstr_stained(n, r);
+  free(r);
+  return ret;
+}
+
+int ncplane_putnstr_aligned(struct ncplane* n, int y, ncalign_e align, size_t s, const char* str){
+  char* chopped = strndup(str, s);
+  int ret = ncplane_putstr_aligned(n, y, align, chopped);
+  free(chopped);
+  return ret;
+}
+
+int ncplane_hline_interp(ncplane* n, const nccell* c, unsigned len,
                          uint64_t c1, uint64_t c2){
+  if(len <= 0){
+    logerror("passed invalid length %u", len);
+    return -1;
+  }
   unsigned ur, ug, ub;
   int r1, g1, b1, r2, g2, b2;
   int br1, bg1, bb1, br2, bg2, bb2;
-  channels_fg_rgb(c1, &ur, &ug, &ub);
+  ncchannels_fg_rgb8(c1, &ur, &ug, &ub);
   r1 = ur; g1 = ug; b1 = ub;
-  channels_fg_rgb(c2, &ur, &ug, &ub);
+  ncchannels_fg_rgb8(c2, &ur, &ug, &ub);
   r2 = ur; g2 = ug; b2 = ub;
-  channels_bg_rgb(c1, &ur, &ug, &ub);
+  ncchannels_bg_rgb8(c1, &ur, &ug, &ub);
   br1 = ur; bg1 = ug; bb1 = ub;
-  channels_bg_rgb(c2, &ur, &ug, &ub);
+  ncchannels_bg_rgb8(c2, &ur, &ug, &ub);
   br2 = ur; bg2 = ug; bb2 = ub;
   int deltr = r2 - r1;
   int deltg = g2 - g1;
@@ -1492,69 +2179,74 @@ int ncplane_hline_interp(ncplane* n, const cell* c, int len,
   int deltbr = br2 - br1;
   int deltbg = bg2 - bg1;
   int deltbb = bb2 - bb1;
-  int ret;
-  cell dupc = CELL_TRIVIAL_INITIALIZER;
-  if(cell_duplicate(n, &dupc, c) < 0){
+  unsigned ret;
+  nccell dupc = NCCELL_TRIVIAL_INITIALIZER;
+  if(nccell_duplicate(n, &dupc, c) < 0){
     return -1;
   }
   bool fgdef = false, bgdef = false;
-  if(channels_fg_default_p(c1) && channels_fg_default_p(c2)){
+  if(ncchannels_fg_default_p(c1) && ncchannels_fg_default_p(c2)){
     fgdef = true;
   }
-  if(channels_bg_default_p(c1) && channels_bg_default_p(c2)){
+  if(ncchannels_bg_default_p(c1) && ncchannels_bg_default_p(c2)){
     bgdef = true;
   }
   for(ret = 0 ; ret < len ; ++ret){
-    int r = (deltr * ret) / len + r1;
-    int g = (deltg * ret) / len + g1;
-    int b = (deltb * ret) / len + b1;
-    int br = (deltbr * ret) / len + br1;
-    int bg = (deltbg * ret) / len + bg1;
-    int bb = (deltbb * ret) / len + bb1;
+    int r = (deltr * (int)ret) / (int)len + r1;
+    int g = (deltg * (int)ret) / (int)len + g1;
+    int b = (deltb * (int)ret) / (int)len + b1;
+    int br = (deltbr * (int)ret) / (int)len + br1;
+    int bg = (deltbg * (int)ret) / (int)len + bg1;
+    int bb = (deltbb * (int)ret) / (int)len + bb1;
     if(!fgdef){
-      cell_set_fg_rgb(&dupc, r, g, b);
+      nccell_set_fg_rgb8(&dupc, r, g, b);
     }
     if(!bgdef){
-      cell_set_bg_rgb(&dupc, br, bg, bb);
+      nccell_set_bg_rgb8(&dupc, br, bg, bb);
     }
     if(ncplane_putc(n, &dupc) <= 0){
-      break;
+      return -1;
     }
   }
-  cell_release(n, &dupc);
+  nccell_release(n, &dupc);
   return ret;
 }
 
-int ncplane_vline_interp(ncplane* n, const cell* c, int len,
+int ncplane_vline_interp(ncplane* n, const nccell* c, unsigned len,
                          uint64_t c1, uint64_t c2){
+  if(len <= 0){
+    logerror("passed invalid length %u", len);
+    return -1;
+  }
   unsigned ur, ug, ub;
   int r1, g1, b1, r2, g2, b2;
   int br1, bg1, bb1, br2, bg2, bb2;
-  channels_fg_rgb(c1, &ur, &ug, &ub);
+  ncchannels_fg_rgb8(c1, &ur, &ug, &ub);
   r1 = ur; g1 = ug; b1 = ub;
-  channels_fg_rgb(c2, &ur, &ug, &ub);
+  ncchannels_fg_rgb8(c2, &ur, &ug, &ub);
   r2 = ur; g2 = ug; b2 = ub;
-  channels_bg_rgb(c1, &ur, &ug, &ub);
+  ncchannels_bg_rgb8(c1, &ur, &ug, &ub);
   br1 = ur; bg1 = ug; bb1 = ub;
-  channels_bg_rgb(c2, &ur, &ug, &ub);
+  ncchannels_bg_rgb8(c2, &ur, &ug, &ub);
   br2 = ur; bg2 = ug; bb2 = ub;
-  int deltr = (r2 - r1) / (len + 1);
-  int deltg = (g2 - g1) / (len + 1);
-  int deltb = (b2 - b1) / (len + 1);
-  int deltbr = (br2 - br1) / (len + 1);
-  int deltbg = (bg2 - bg1) / (len + 1);
-  int deltbb = (bb2 - bb1) / (len + 1);
-  int ret, ypos, xpos;
+  int deltr = (r2 - r1) / ((int)len + 1);
+  int deltg = (g2 - g1) / ((int)len + 1);
+  int deltb = (b2 - b1) / ((int)len + 1);
+  int deltbr = (br2 - br1) / ((int)len + 1);
+  int deltbg = (bg2 - bg1) / ((int)len + 1);
+  int deltbb = (bb2 - bb1) / ((int)len + 1);
+  unsigned ypos, xpos;
+  unsigned ret;
   ncplane_cursor_yx(n, &ypos, &xpos);
-  cell dupc = CELL_TRIVIAL_INITIALIZER;
-  if(cell_duplicate(n, &dupc, c) < 0){
+  nccell dupc = NCCELL_TRIVIAL_INITIALIZER;
+  if(nccell_duplicate(n, &dupc, c) < 0){
     return -1;
   }
   bool fgdef = false, bgdef = false;
-  if(channels_fg_default_p(c1) && channels_fg_default_p(c2)){
+  if(ncchannels_fg_default_p(c1) && ncchannels_fg_default_p(c2)){
     fgdef = true;
   }
-  if(channels_bg_default_p(c1) && channels_bg_default_p(c2)){
+  if(ncchannels_bg_default_p(c1) && ncchannels_bg_default_p(c2)){
     bgdef = true;
   }
   for(ret = 0 ; ret < len ; ++ret){
@@ -1568,41 +2260,40 @@ int ncplane_vline_interp(ncplane* n, const cell* c, int len,
     bg1 += deltbg;
     bb1 += deltbb;
     if(!fgdef){
-      cell_set_fg_rgb(&dupc, r1, g1, b1);
+      nccell_set_fg_rgb8(&dupc, r1, g1, b1);
     }
     if(!bgdef){
-      cell_set_bg_rgb(&dupc, br1, bg1, bb1);
+      nccell_set_bg_rgb8(&dupc, br1, bg1, bb1);
     }
     if(ncplane_putc(n, &dupc) <= 0){
-      break;
+      return -1;
     }
   }
-  cell_release(n, &dupc);
+  nccell_release(n, &dupc);
   return ret;
 }
 
-// how many edges need touch a corner for it to be printed?
-static inline unsigned
-box_corner_needs(unsigned ctlword){
-  return (ctlword & NCBOXCORNER_MASK) >> NCBOXCORNER_SHIFT;
-}
-
-int ncplane_box(ncplane* n, const cell* ul, const cell* ur,
-                const cell* ll, const cell* lr, const cell* hl,
-                const cell* vl, int ystop, int xstop,
+// we must have at least 2x2, or it's an error
+int ncplane_box(ncplane* n, const nccell* ul, const nccell* ur,
+                const nccell* ll, const nccell* lr, const nccell* hl,
+                const nccell* vl, unsigned ystop, unsigned xstop,
                 unsigned ctlword){
-  int yoff, xoff, ymax, xmax;
+  unsigned yoff, xoff;
   ncplane_cursor_yx(n, &yoff, &xoff);
   // must be at least 2x2, with its upper-left corner at the current cursor
   if(ystop < yoff + 1){
+    logerror("ystop (%u) insufficient for yoff (%d)", ystop, yoff);
     return -1;
   }
   if(xstop < xoff + 1){
+    logerror("xstop (%u) insufficient for xoff (%d)", xstop, xoff);
     return -1;
   }
+  unsigned ymax, xmax;
   ncplane_dim_yx(n, &ymax, &xmax);
   // must be within the ncplane
   if(xstop >= xmax || ystop >= ymax){
+    logerror("boundary (%ux%u) beyond plane (%dx%d)", ystop, xstop, ymax, xmax);
     return -1;
   }
   unsigned edges;
@@ -1713,6 +2404,9 @@ int ncplane_box(ncplane* n, const cell* ul, const cell* ur,
 static void
 move_bound_planes(ncplane* n, int dy, int dx){
   while(n){
+    if(n->sprite){
+      sprixel_movefrom(n->sprite, n->absy, n->absx);
+    }
     n->absy += dy;
     n->absx += dx;
     move_bound_planes(n->blist, dy, dx);
@@ -1721,101 +2415,167 @@ move_bound_planes(ncplane* n, int dy, int dx){
 }
 
 int ncplane_move_yx(ncplane* n, int y, int x){
-  if(n == n->nc->stdscr){
+  if(n == ncplane_notcurses(n)->stdplane){
     return -1;
   }
   int dy, dx; // amount moved
-  if(n->bound){
-    dy = (n->bound->absy + y) - n->absy;
-    dx = (n->bound->absx + x) - n->absx;
+  if(n->boundto == n){
+    dy = y - n->absy;
+    dx = x - n->absx;
   }else{
-    dy = (n->nc->stdscr->absy + y) - n->absy;
-    dx = (n->nc->stdscr->absx + x) - n->absx;
+    dy = (n->boundto->absy + y) - n->absy;
+    dx = (n->boundto->absx + x) - n->absx;
   }
-  n->absx += dx;
-  n->absy += dy;
-  move_bound_planes(n->blist, dy, dx);
+  if(dy || dx){ // don't want to trigger sprixel_movefrom() if unneeded
+    if(n->sprite){
+      sprixel_movefrom(n->sprite, n->absy, n->absx);
+    }
+    n->absx += dx;
+    n->absy += dy;
+    move_bound_planes(n->blist, dy, dx);
+  }
   return 0;
+}
+
+int ncplane_y(const ncplane* n){
+  if(n->boundto == n){
+    return n->absy;
+  }
+  return n->absy - n->boundto->absy;
+}
+
+int ncplane_x(const ncplane* n){
+  if(n->boundto == n){
+    return n->absx;
+  }
+  return n->absx - n->boundto->absx;
 }
 
 void ncplane_yx(const ncplane* n, int* y, int* x){
   if(y){
-    *y = n->absy - n->nc->stdscr->absy;
+    *y = ncplane_y(n);
   }
   if(x){
-    *x = n->absx - n->nc->stdscr->absx;
+    *x = ncplane_x(n);
   }
 }
 
+// special case of ncplane_erase_region()
 void ncplane_erase(ncplane* n){
-  // we must preserve the background, but a pure cell_duplicate() would be
-  // wiped out by the egcpool_dump(). do a duplication (to get the attrword
+  loginfo("erasing %dx%d plane", n->leny, n->lenx);
+  if(n->sprite){
+    sprixel_hide(n->sprite);
+    destroy_tam(n);
+  }
+  // we must preserve the background, but a pure nccell_duplicate() would be
+  // wiped out by the egcpool_dump(). do a duplication (to get the stylemask
   // and channels), and then reload.
-  char* egc = cell_egc_copy(n, &n->basecell);
-  memset(n->fb, 0, sizeof(*n->fb) * n->lenx * n->leny);
+  char* egc = nccell_strdup(n, &n->basecell);
+  memset(n->fb, 0, sizeof(*n->fb) * n->leny * n->lenx);
   egcpool_dump(&n->pool);
-  egcpool_init(&n->pool);
-  cell_load(n, &n->basecell, egc);
+  // we need to zero out the EGC before handing this off to nccell_load, but
+  // we don't want to lose the channels/attributes, so explicit gcluster load.
+  n->basecell.gcluster = 0;
+  nccell_load(n, &n->basecell, egc);
   free(egc);
+  n->y = n->x = 0;
 }
 
-void notcurses_cursor_enable(notcurses* nc){
-  if(nc->cnorm){
-    term_emit("cnorm", nc->cnorm, nc->ttyfp, false);
+int ncplane_erase_region(ncplane* n, int ystart, int xstart, int ylen, int xlen){
+  if(ystart == -1){
+    ystart = n->y;
   }
-}
-
-void notcurses_cursor_disable(notcurses* nc){
-  if(nc->civis){
-    term_emit("civis", nc->civis, nc->ttyfp, false);
+  if(xstart == -1){
+    xstart = n->x;
   }
+  if(ystart < 0 || xstart < 0){
+    logerror("illegal start of erase (%d, %d)", ystart, xstart);
+    return -1;
+  }
+  if(ystart >= (int)ncplane_dim_y(n) || xstart >= (int)ncplane_dim_x(n)){
+    logerror("illegal start of erase (%d, %d)", ystart, xstart);
+    return -1;
+  }
+  if(xlen < 0){
+    if(xlen + 1 < -xstart){
+      xlen = -xstart - 1;
+    }
+    xstart = xstart + xlen + 1;
+    xlen = -xlen;
+  }else if(xlen == 0){
+    xstart = 0;
+    xlen = ncplane_dim_x(n);
+  }
+  if(xlen > (int)ncplane_dim_x(n) || xstart + xlen > (int)ncplane_dim_x(n)){
+    xlen = ncplane_dim_x(n) - xstart;
+  }
+  if(ylen < 0){
+    if(ylen + 1 < -ystart){
+      ylen = -ystart - 1;
+    }
+    ystart = ystart + ylen + 1;
+    ylen = -ylen;
+  }else if(ylen == 0){
+    ystart = 0;
+    ylen = ncplane_dim_y(n);
+  }
+  if(ylen > (int)ncplane_dim_y(n) || ystart + ylen > (int)ncplane_dim_y(n)){
+    ylen = ncplane_dim_y(n) - ystart;
+  }
+  // special-case the full plane erasure, as it's powerfully optimized (O(1))
+  if(ystart == 0 && xstart == 0 &&
+      ylen == (int)ncplane_dim_y(n) && xlen == (int)ncplane_dim_x(n)){
+    int tmpy = n->y; // preserve cursor location
+    int tmpx = n->x;
+    ncplane_erase(n);
+    n->y = tmpy;
+    n->x = tmpx;
+    return 0;
+  }
+  loginfo("erasing %d/%d - %d/%d", ystart, xstart, ystart + ylen, xstart + xlen);
+  for(int y = ystart ; y < ystart + ylen ; ++y){
+    for(int x = xstart ; x < xstart + xlen ; ++x){
+      nccell_release(n, &n->fb[nfbcellidx(n, y, x)]);
+      nccell_init(&n->fb[nfbcellidx(n, y, x)]);
+    }
+  }
+  return 0;
 }
 
-ncplane* notcurses_top(notcurses* n){
-  return n->top;
+ncplane* ncpile_top(ncplane* n){
+  return ncplane_pile(n)->top;
+}
+
+ncplane* ncpile_bottom(ncplane* n){
+  return ncplane_pile(n)->bottom;
 }
 
 ncplane* ncplane_below(ncplane* n){
-  return n->z;
+  return n->below;
 }
 
-// FIXME this clears the screen for some reason! what's up?
-#define SET_BTN_EVENT_MOUSE   "1002"
-#define SET_FOCUS_EVENT_MOUSE "1004"
-#define SET_SGR_MODE_MOUSE    "1006"
-int notcurses_mouse_enable(notcurses* n){
-  return term_emit("mouse", ESC "[?" SET_BTN_EVENT_MOUSE ";"
-                   /*SET_FOCUS_EVENT_MOUSE ";" */SET_SGR_MODE_MOUSE "h",
-                   n->ttyfp, true);
+ncplane* ncplane_above(ncplane* n){
+  return n->above;
 }
 
-// this seems to work (note difference in suffix, 'l' vs 'h'), but what about
-// the sequences 1000 etc?
-int notcurses_mouse_disable(notcurses* n){
-  return term_emit("mouse", ESC "[?" SET_BTN_EVENT_MOUSE ";"
-                   /*SET_FOCUS_EVENT_MOUSE ";" */SET_SGR_MODE_MOUSE "l",
-                   n->ttyfp, true);
+int notcurses_mice_enable(notcurses* n, unsigned eventmask){
+  if(mouse_setup(&n->tcache, eventmask)){
+    return -1;
+  }
+  return 0;
 }
 
-bool notcurses_canfade(const notcurses* nc){
-  return nc->CCCflag || nc->RGBflag;
-}
-
-bool notcurses_canchangecolor(const notcurses* nc){
-  return nc->CCCflag;
-}
-
-palette256* palette256_new(notcurses* nc){
-  palette256* p = malloc(sizeof(*p));
+ncpalette* ncpalette_new(notcurses* nc){
+  ncpalette* p = malloc(sizeof(*p));
   if(p){
     memcpy(p, &nc->palette, sizeof(*p));
   }
   return p;
 }
 
-int palette256_use(notcurses* nc, const palette256* p){
+int ncpalette_use(notcurses* nc, const ncpalette* p){
   int ret = -1;
-  if(!nc->CCCflag){
+  if(!notcurses_canchangecolor(nc)){
     return -1;
   }
   for(size_t z = 0 ; z < sizeof(p->chans) / sizeof(*p->chans) ; ++z){
@@ -1828,7 +2588,7 @@ int palette256_use(notcurses* nc, const palette256* p){
   return ret;
 }
 
-void palette256_free(palette256* p){
+void ncpalette_free(ncpalette* p){
   free(p);
 }
 
@@ -1838,7 +2598,8 @@ bool ncplane_translate_abs(const ncplane* n, int* restrict y, int* restrict x){
     if(*y < 0){
       return false;
     }
-    if(*y >= n->leny){
+    unsigned yval = *y;
+    if(yval >= n->leny){
       return false;
     }
   }
@@ -1846,7 +2607,8 @@ bool ncplane_translate_abs(const ncplane* n, int* restrict y, int* restrict x){
     if(*x < 0){
       return false;
     }
-    if(*x >= n->lenx){
+    unsigned xval = *x;
+    if(xval >= n->lenx){
       return false;
     }
   }
@@ -1866,32 +2628,751 @@ void ncplane_translate(const ncplane* src, const ncplane* dst,
   }
 }
 
-notcurses* ncplane_notcurses(ncplane* n){
-  return n->nc;
+notcurses* ncplane_notcurses(const ncplane* n){
+  return ncplane_pile(n)->nc;
 }
 
+const notcurses* ncplane_notcurses_const(const ncplane* n){
+  return ncplane_pile_const(n)->nc;
+}
+
+int ncplane_abs_y(const ncplane* n){
+  return n->absy;
+}
+
+int ncplane_abs_x(const ncplane* n){
+  return n->absx;
+}
+
+void ncplane_abs_yx(const ncplane* n, int* RESTRICT y, int* RESTRICT x){
+  if(y){
+    *y = ncplane_abs_y(n);
+  }
+  if(x){
+    *x = ncplane_abs_x(n);
+  }
+}
+
+ncplane* ncplane_parent(ncplane* n){
+  return n->boundto;
+}
+
+const ncplane* ncplane_parent_const(const ncplane* n){
+  return n->boundto;
+}
+
+int ncplane_set_name(ncplane* n, const char* name){
+  char* copy = name ? strdup(name) : NULL;
+  if(copy == NULL && name != NULL){
+    return -1;
+  }
+  free(n->name);
+  n->name = copy;
+  return 0;
+}
+
+char* ncplane_name(const ncplane* n){
+  return n->name ? strdup(n->name) : NULL;
+}
+
+void ncplane_set_resizecb(ncplane* n, int(*resizecb)(ncplane*)){
+  n->resizecb = resizecb;
+}
+
+int (*ncplane_resizecb(const ncplane* n))(ncplane*){
+  return n->resizecb;
+}
+
+int ncplane_resize_placewithin(ncplane* n){
+  if(n->boundto == n){
+    return 0;
+  }
+  int absy = ncplane_abs_y(n);
+  int absx = ncplane_abs_x(n);
+  int ret = 0;
+  if(absy + ncplane_dim_y(n) > ncplane_dim_y(n->boundto)){
+    const int dy = (absy + ncplane_dim_y(n)) - ncplane_dim_y(n->boundto);
+    logdebug("moving up %d", dy);
+    if(ncplane_move_rel(n, -dy, 0)){
+      ret = -1;
+    }
+    absy = ncplane_abs_y(n);
+  }
+  if(absx + ncplane_dim_x(n) > ncplane_dim_x(n->boundto)){
+    const int dx = ncplane_dim_x(n->boundto) - (absx + ncplane_dim_x(n));
+    logdebug("moving left %d", dx);
+    if(ncplane_move_rel(n, 0, dx)){
+      ret = -1;
+    }
+    absx = ncplane_abs_x(n);
+  }
+  // this will prefer upper-left material if the child plane is larger than
+  // the parent. we might want a smarter rule, one based on origin?
+  if(absy < 0){
+    logdebug("moving down %d", -absy);
+    // we're at least partially above our parent
+    if(ncplane_move_rel(n, -absy, 0)){
+      ret = -1;
+    }
+  }
+  if(absx < 0){
+    logdebug("moving right %d", -absx);
+    // we're at least partially to the left of our parent
+    if(ncplane_move_rel(n, 0, -absx)){
+      ret = -1;
+    }
+  }
+  return ret;
+}
+
+int ncplane_resize_marginalized(ncplane* n){
+  const ncplane* parent = ncplane_parent_const(n);
+  // a marginalized plane cannot be larger than its oppressor plane =]
+  unsigned maxy, maxx;
+  if(parent == n){ // root plane, need to use pile size
+    ncpile* p = ncplane_pile(n);
+    maxy = p->dimy;
+    maxx = p->dimx;
+  }else{
+    ncplane_dim_yx(parent, &maxy, &maxx);
+  }
+  if((maxy -= (n->margin_b + (n->absy - n->boundto->absy))) < 1){
+    maxy = 1;
+  }
+  if((maxx -= (n->margin_r + (n->absx - n->boundto->absx))) < 1){
+    maxx = 1;
+  }
+  unsigned oldy, oldx;
+  ncplane_dim_yx(n, &oldy, &oldx); // current dimensions of 'n'
+  unsigned keepleny = oldy > maxy ? maxy : oldy;
+  unsigned keeplenx = oldx > maxx ? maxx : oldx;
+  if(ncplane_resize_internal(n, 0, 0, keepleny, keeplenx, 0, 0, maxy, maxx)){
+    return -1;
+  }
+  int targy = maxy - n->margin_b;
+  int targx = maxx - n->margin_b;
+  loginfo("marg %d/%d, pdim %d/%d, move %d/%d", n->margin_b, n->margin_r, maxy, maxx, targy, targx);
+  return ncplane_move_yx(n, targy, targx);
+}
+
+int ncplane_resize_maximize(ncplane* n){
+  const ncpile* pile = ncplane_pile(n); // FIXME should be taken against parent
+  const unsigned rows = pile->dimy;
+  const unsigned cols = pile->dimx;
+  unsigned oldy, oldx;
+  ncplane_dim_yx(n, &oldy, &oldx); // current dimensions of 'n'
+  unsigned keepleny = oldy > rows ? rows : oldy;
+  unsigned keeplenx = oldx > cols ? cols : oldx;
+  return ncplane_resize_internal(n, 0, 0, keepleny, keeplenx, 0, 0, rows, cols);
+}
+
+int ncplane_resize_realign(ncplane* n){
+  const ncplane* parent = ncplane_parent_const(n);
+  if(parent == n){
+    logerror("can't realign a root plane");
+    return 0;
+  }
+  if(n->halign == NCALIGN_UNALIGNED && n->valign == NCALIGN_UNALIGNED){
+    logerror("passed a non-aligned plane");
+    return -1;
+  }
+  int xpos = ncplane_x(n);
+  if(n->halign != NCALIGN_UNALIGNED){
+    xpos = ncplane_halign(parent, n->halign, ncplane_dim_x(n));
+  }
+  int ypos = ncplane_y(n);
+  if(n->valign != NCALIGN_UNALIGNED){
+    ypos = ncplane_valign(parent, n->valign, ncplane_dim_y(n));
+  }
+  return ncplane_move_yx(n, ypos, xpos);
+}
+
+// The standard plane cannot be reparented; we return NULL in that case.
+// If provided |newparent|==|n|, we are moving |n| to its own pile. If |n|
+// is already bound to |newparent|, this is a no-op, and we return |n|.
+// This is essentially a wrapper around ncplane_reparent_family() that first
+// reparents any children to the parent of 'n', or makes them root planes if
+// 'n' is a root plane.
 ncplane* ncplane_reparent(ncplane* n, ncplane* newparent){
-  if(n == n->nc->stdscr){
+  const notcurses* nc = ncplane_notcurses_const(n);
+  if(n == nc->stdplane){
+    logerror("won't reparent standard plane");
     return NULL; // can't reparent standard plane
   }
-  if(n->bound){ // detach it, and extract it from list
-    for(ncplane** prev = &n->bound->blist ; *prev ; prev = &(*prev)->bnext){
-      if(*prev == n){
-        *prev = n->bnext;
-        break;
-      }
-    }
-    n->bnext = NULL;
+  if(n->boundto == newparent){
+    loginfo("won't reparent plane to itself");
+    return n; // don't return error, just a no-op
   }
-  if( (n->bound = newparent) ){
-    n->bnext = newparent->blist;
+//notcurses_debug(ncplane_notcurses(n), stderr);
+  if(n->blist){
+    if(n->boundto == n){ // children become new root planes
+      ncplane* lastlink;
+      ncplane* child = n->blist;
+      do{
+        child->boundto = child;
+        lastlink = child;
+        child = child->bnext;
+      }while(child); // n->blist != NULL -> lastlink != NULL
+      if( (lastlink->bnext = ncplane_pile(n)->roots) ){
+        lastlink->bnext->bprev = &lastlink->bnext;
+      }
+      n->blist->bprev = &ncplane_pile(n)->roots;
+      ncplane_pile(n)->roots = n->blist;
+    }else{ // children are rebound to current parent
+      ncplane* lastlink;
+      ncplane* child = n->blist;
+      do{
+        child->boundto = n->boundto;
+        lastlink = child;
+        child = child->bnext;
+      }while(child); // n->blist != NULL -> lastlink != NULL
+      if( (lastlink->bnext = n->boundto->blist) ){
+        lastlink->bnext->bprev = &lastlink->bnext;
+      }
+      n->blist->bprev = &n->boundto->blist;
+      n->boundto->blist = n->blist;
+    }
+    n->blist = NULL;
+  }
+  // FIXME would be nice to skip ncplane_descendant_p() on this call...:/
+  return ncplane_reparent_family(n, newparent);
+}
+
+// unsplice self from the z-axis, and then unsplice all children, recursively.
+// to be called before unbinding 'n' from old pile.
+static void
+unsplice_zaxis_recursive(ncplane* n){
+  // might already have been unspliced, in which case ->above/->below are NULL
+  if(ncplane_pile(n)->top == n){
+    ncplane_pile(n)->top = n->below;
+  }else if(n->above){
+    n->above->below = n->below;
+  }
+  if(ncplane_pile(n)->bottom == n){
+    ncplane_pile(n)->bottom = n->above;
+  }else if(n->below){
+    n->below->above = n->above;
+  }
+  for(ncplane* child = n->blist ; child ; child = child->bnext){
+    unsplice_zaxis_recursive(child);
+  }
+  n->below = n->above = NULL;
+}
+
+// unsplice our sprixel from the pile's sprixellist, and then unsplice all
+// children, recursively. call before unbinding. returns a doubly-linked
+// list of any sprixels found.
+static sprixel*
+unsplice_sprixels_recursive(ncplane* n, sprixel* prev){
+  sprixel* s = n->sprite;
+  if(s){
+    if(s->prev){
+      s->prev->next = s->next;
+    }else{
+      ncplane_pile(n)->sprixelcache = s->next;
+    }
+    if(s->next){
+      s->next->prev = s->prev;
+    }
+    if( (s->prev = prev) ){
+      prev->next = s;
+    }
+    s->next = NULL;
+    prev = s;
+  }
+  for(ncplane* child = n->blist ; child ; child = child->bnext){
+    unsplice_sprixels_recursive(child, prev);
+    while(prev && prev->next){ // FIXME lame
+      prev = prev->next;
+    }
+  }
+  return prev;
+}
+
+// recursively splice 'n' and children into the z-axis, above 'n->boundto'.
+// handles 'n' == 'n->boundto'. to be called after binding 'n' into new pile.
+static void
+splice_zaxis_recursive(ncplane* n, ncpile* p, unsigned ocellpxy, unsigned ocellpxx,
+                       unsigned ncellpxy, unsigned ncellpxx){
+  n->pile = p;
+  if(n != n->boundto){
+    if((n->above = n->boundto->above) == NULL){
+      n->pile->top = n;
+    }else{
+      n->boundto->above->below = n;
+    }
+    n->below = n->boundto;
+    n->boundto->above = n;
+  }
+  if(n->sprite){
+    if(ocellpxy != ncellpxy || ocellpxx != ncellpxx){
+      sprixel_rescale(n->sprite, ncellpxy, ncellpxx);
+      // FIXME do what on error?
+    }
+  }
+  for(ncplane* child = n->blist ; child ; child = child->bnext){
+    splice_zaxis_recursive(child, p, ocellpxy, ocellpxx, ncellpxy, ncellpxx);
+  }
+}
+
+ncplane* ncplane_reparent_family(ncplane* n, ncplane* newparent){
+  // ncplane_notcurses() goes through ncplane_pile(). since we're possibly
+  // destroying piles below, get the notcurses reference early on.
+  notcurses* nc = ncplane_notcurses(n);
+  if(n == nc->stdplane){
+    return NULL; // can't reparent standard plane
+  }
+  if(n->boundto == newparent){ // no-op
+    return n;
+  }
+  if(ncplane_descendant_p(newparent, n)){
+    return NULL;
+  }
+//notcurses_debug(ncplane_notcurses(n), stderr);
+  if(n->bprev){ // extract from sibling list
+    if( (*n->bprev = n->bnext) ){
+      n->bnext->bprev = n->bprev;
+    }
+  }else if(n->bnext){
+    n->bnext->bprev = NULL;
+  }
+  n->bprev = NULL;
+  n->bnext = NULL;
+  // if leaving a pile, extract n from the old zaxis, and also any sprixel
+  sprixel* s = NULL;
+  if(n == newparent || ncplane_pile(n) != ncplane_pile(newparent)){
+    unsplice_zaxis_recursive(n);
+    s = unsplice_sprixels_recursive(n, NULL);
+  }
+  const unsigned ocellpxy = ncplane_pile(n)->cellpxy;
+  const unsigned ocellpxx = ncplane_pile(n)->cellpxx;
+  n->boundto = newparent;
+  if(n == n->boundto){ // we're a new root plane
+    logdebug("reparenting new root plane %p", n);
+    unsplice_zaxis_recursive(n);
+    n->bnext = NULL;
+    n->bprev = NULL;
+    pthread_mutex_lock(&nc->pilelock);
+    if(ncplane_pile(n)->top == NULL){ // did we just empty our pile?
+      ncpile_destroy(ncplane_pile(n));
+    }
+    make_ncpile(nc, n);
+    unsigned ncellpxy = ncplane_pile(n)->cellpxy;
+    unsigned ncellpxx = ncplane_pile(n)->cellpxx;
+    pthread_mutex_unlock(&nc->pilelock);
+    if(ncplane_pile(n)){ // FIXME otherwise, we've got a problem...!
+      splice_zaxis_recursive(n, ncplane_pile(n), ocellpxy, ocellpxx, ncellpxy, ncellpxx);
+    }
+  }else{ // establish ourselves as a sibling of new parent's children
+    if( (n->bnext = newparent->blist) ){
+      n->bnext->bprev = &n->bnext;
+    }
+    n->bprev = &newparent->blist;
     newparent->blist = n;
+    // place it immediately above the new binding plane if crossing piles
+    if(ncplane_pile(n) != ncplane_pile(n->boundto)){
+      unsigned ncellpxy = ncplane_pile(n->boundto)->cellpxy;
+      unsigned ncellpxx = ncplane_pile(n->boundto)->cellpxx;
+      pthread_mutex_lock(&nc->pilelock);
+      if(ncplane_pile(n)->top == NULL){ // did we just empty our pile?
+        ncpile_destroy(ncplane_pile(n));
+      }
+      n->pile = ncplane_pile(n->boundto);
+      pthread_mutex_unlock(&nc->pilelock);
+      splice_zaxis_recursive(n, ncplane_pile(n), ocellpxy, ocellpxx, ncellpxy, ncellpxx);
+    }
+  }
+  if(s){ // must be on new plane, with sprixels to donate
+    sprixel* lame = s;
+    while(lame->next){
+      lame = lame->next;
+    }
+    if( (lame->next = n->pile->sprixelcache) ){
+      n->pile->sprixelcache->prev = lame;
+    }
+    n->pile->sprixelcache = s;
   }
   return n;
 }
 
-bool ncplane_set_scrolling(ncplane* n, bool scrollp){
+bool ncplane_set_scrolling(ncplane* n, unsigned scrollp){
   bool old = n->scrolling;
   n->scrolling = scrollp;
   return old;
+}
+
+bool ncplane_scrolling_p(const ncplane* n){
+  return n->scrolling;
+}
+
+bool ncplane_set_autogrow(ncplane* n, unsigned growp){
+  if(n == notcurses_stdplane_const(ncplane_notcurses_const(n))){
+    logerror("can't set the standard plane autogrow");
+    return false;
+  }
+  bool old = n->autogrow;
+  n->autogrow = growp;
+  return old;
+}
+
+bool ncplane_autogrow_p(const ncplane* n){
+  return n->autogrow;
+}
+
+// extract an integer, which must be non-negative, and followed by either a
+// comma or a NUL terminator.
+static int
+lex_ulong(const char* op, unsigned* i, char** endptr){
+  errno = 0;
+  long l = strtol(op, endptr, 10);
+  if(l < 0 || (l == LONG_MAX && errno == ERANGE) || (l > INT_MAX)){
+    fprintf(stderr, "invalid margin: %s", op);
+    return -1;
+  }
+  if((**endptr != ',' && **endptr) || *endptr == op){
+    fprintf(stderr, "invalid margin: %s", op);
+    return -1;
+  }
+  *i = l;
+  return 0;
+}
+
+int notcurses_lex_scalemode(const char* op, ncscale_e* scalemode){
+  if(strcasecmp(op, "stretch") == 0){
+    *scalemode = NCSCALE_STRETCH;
+  }else if(strcasecmp(op, "scalehi") == 0){
+    *scalemode = NCSCALE_SCALE_HIRES;
+  }else if(strcasecmp(op, "hires") == 0){
+    *scalemode = NCSCALE_NONE_HIRES;
+  }else if(strcasecmp(op, "scale") == 0){
+    *scalemode = NCSCALE_SCALE;
+  }else if(strcasecmp(op, "none") == 0){
+    *scalemode = NCSCALE_NONE;
+  }else{
+    return -1;
+  }
+  return 0;
+}
+
+const char* notcurses_str_scalemode(ncscale_e scalemode){
+  if(scalemode == NCSCALE_STRETCH){
+    return "stretch";
+  }else if(scalemode == NCSCALE_SCALE){
+    return "scale";
+  }else if(scalemode == NCSCALE_NONE){
+    return "none";
+  }else if(scalemode == NCSCALE_NONE_HIRES){
+    return "hires";
+  }else if(scalemode == NCSCALE_SCALE_HIRES){
+    return "scalehi";
+  }
+  return NULL;
+}
+
+int notcurses_lex_margins(const char* op, notcurses_options* opts){
+  char* eptr;
+  if(lex_ulong(op, &opts->margin_t, &eptr)){
+    return -1;
+  }
+  if(!*eptr){ // allow a single value to be specified for all four margins
+    opts->margin_r = opts->margin_l = opts->margin_b = opts->margin_t;
+    return 0;
+  }
+  op = ++eptr; // once here, we require four values
+  if(lex_ulong(op, &opts->margin_r, &eptr) || !*eptr){
+    return -1;
+  }
+  op = ++eptr;
+  if(lex_ulong(op, &opts->margin_b, &eptr) || !*eptr){
+    return -1;
+  }
+  op = ++eptr;
+  if(lex_ulong(op, &opts->margin_l, &eptr) || *eptr){ // must end in NUL
+    return -1;
+  }
+  return 0;
+}
+
+int notcurses_inputready_fd(notcurses* n){
+  return inputready_fd(n->tcache.ictx);
+}
+
+int ncdirect_inputready_fd(ncdirect* n){
+  return inputready_fd(n->tcache.ictx);
+}
+
+// FIXME speed this up, PoC
+// given an egc, get its index in the blitter's EGC set
+static int
+get_blitter_egc_idx(const struct blitset* bset, const char* egc){
+  wchar_t wc;
+  mbstate_t mbs = {0};
+  size_t sret = mbrtowc(&wc, egc, strlen(egc), &mbs);
+  if(sret == (size_t)-1 || sret == (size_t)-2){
+    return -1;
+  }
+  wchar_t* wptr = wcsrchr(bset->egcs, wc);
+  if(wptr == NULL){
+//fprintf(stderr, "FAILED TO FIND [%s] (%lc) in [%ls]\n", egc, wc, bset->egcs);
+    return -1;
+  }
+//fprintf(stderr, "FOUND [%s] (%lc) in [%ls] (%zu)\n", egc, wc, bset->egcs, wptr - bset->egcs);
+  return wptr - bset->egcs;
+}
+
+static bool
+is_bg_p(int idx, int py, int px, int width){
+  // bit increases to the right, and down
+  const int bpos = py * width + px; // bit corresponding to pixel, 0..|egcs|-1
+  const unsigned mask = 1u << bpos;
+  if(idx & mask){
+    return false;
+  }
+  return true;
+}
+
+static inline uint32_t*
+ncplane_as_rgba_internal(const ncplane* nc, ncblitter_e blit,
+                         int begy, int begx, unsigned leny, unsigned lenx,
+                         unsigned* pxdimy, unsigned* pxdimx){
+  const notcurses* ncur = ncplane_notcurses_const(nc);
+  unsigned ystart, xstart;
+  if(check_geometry_args(nc, begy, begx, &leny, &lenx, &ystart, &xstart)){
+    return NULL;
+  }
+  if(blit == NCBLIT_PIXEL){ // FIXME extend this to support sprixels
+    logerror("pixel blitter %d not yet supported", blit);
+    return NULL;
+  }
+  if(blit == NCBLIT_DEFAULT){
+    logerror("must specify exact blitter, not NCBLIT_DEFAULT");
+    return NULL;
+  }
+  const struct blitset* bset = lookup_blitset(&ncur->tcache, blit, false);
+  if(bset == NULL){
+    logerror("blitter %d invalid in current environment", blit);
+    return NULL;
+  }
+//fprintf(stderr, "ALLOCATING %u %d %d %p\n", 4u * lenx * leny * 2, leny, lenx, bset);
+  if(pxdimy){
+    *pxdimy = leny * bset->height;
+  }
+  if(pxdimx){
+    *pxdimx = lenx * bset->width;
+  }
+  uint32_t* ret = malloc(sizeof(*ret) * lenx * bset->width * leny * bset->height);
+//fprintf(stderr, "GEOM: %d/%d %d/%d ret: %p\n", bset->height, bset->width, *pxdimy, *pxdimx, ret);
+  if(ret){
+    for(unsigned y = ystart, targy = 0 ; y < ystart + leny ; ++y, targy += bset->height){
+      for(unsigned x = xstart, targx = 0 ; x < xstart + lenx ; ++x, targx += bset->width){
+        uint16_t stylemask;
+        uint64_t channels;
+        char* c = ncplane_at_yx(nc, y, x, &stylemask, &channels);
+        if(c == NULL){
+          free(ret);
+          return NULL;
+        }
+        int idx = get_blitter_egc_idx(bset, c);
+        if(idx < 0){
+          free(ret);
+          free(c);
+          return NULL;
+        }
+        unsigned fr, fg, fb, br, bg, bb, fa, ba;
+        ncchannels_fg_rgb8(channels, &fr, &fb, &fg);
+        fa = ncchannels_fg_alpha(channels);
+        ncchannels_bg_rgb8(channels, &br, &bb, &bg);
+        ba = ncchannels_bg_alpha(channels);
+        // handle each destination pixel from this cell
+        for(unsigned py = 0 ; py < bset->height ; ++py){
+          for(unsigned px = 0 ; px < bset->width ; ++px){
+            uint32_t* p = &ret[(targy + py) * (lenx * bset->width) + (targx + px)];
+            bool background = is_bg_p(idx, py, px, bset->width);
+            *p = 0;
+            if(background){
+              if(!ba){
+                ncpixel_set_a(p, 0xff);
+                ncpixel_set_r(p, br);
+                ncpixel_set_g(p, bb);
+                ncpixel_set_b(p, bg);
+              }
+            }else{
+              if(!fa){
+                ncpixel_set_a(p, 0xff);
+                ncpixel_set_r(p, fr);
+                ncpixel_set_g(p, fb);
+                ncpixel_set_b(p, fg);
+              }
+            }
+          }
+        }
+        free(c);
+      }
+    }
+  }
+  return ret;
+}
+
+uint32_t* ncplane_as_rgba(const ncplane* nc, ncblitter_e blit,
+                          int begy, int begx, unsigned leny,
+                          unsigned lenx, unsigned* pxdimy, unsigned* pxdimx){
+  unsigned px, py;
+  if(!pxdimy){
+    pxdimy = &py;
+  }
+  if(!pxdimx){
+    pxdimx = &px;
+  }
+  return ncplane_as_rgba_internal(nc, blit, begy, begx, leny, lenx, pxdimy, pxdimx);
+}
+
+// return a heap-allocated copy of the contents
+char* ncplane_contents(ncplane* nc, int begy, int begx, unsigned leny, unsigned lenx){
+  unsigned ystart, xstart;
+  if(check_geometry_args(nc, begy, begx, &leny, &lenx, &ystart, &xstart)){
+    return NULL;
+  }
+  size_t retlen = 1;
+  char* ret = malloc(retlen);
+  if(ret){
+    for(unsigned y = ystart, targy = 0 ; y < ystart + leny ; ++y, targy += 2){
+      for(unsigned x = xstart, targx = 0 ; x < xstart + lenx ; ++x, ++targx){
+        nccell ncl = NCCELL_TRIVIAL_INITIALIZER;
+        // we need ncplane_at_yx_cell() here instead of ncplane_at_yx(),
+        // because we should only have one copy of each wide EGC.
+        int clen;
+        if((clen = ncplane_at_yx_cell(nc, y, x, &ncl)) < 0){
+          free(ret);
+          return NULL;
+        }
+        const char* c = nccell_extended_gcluster(nc, &ncl);
+        if(clen){
+          char* tmp = realloc(ret, retlen + clen);
+          if(!tmp){
+            free(ret);
+            return NULL;
+          }
+          ret = tmp;
+          memcpy(ret + retlen - 1, c, clen);
+          retlen += clen;
+        }
+      }
+    }
+    ret[retlen - 1] = '\0';
+  }
+  return ret;
+}
+
+// find the center coordinate of a plane, preferring the top/left in the
+// case of an even number of rows/columns (in such a case, there will be one
+// more cell to the bottom/right of the center than the top/left). the
+// center is then modified relative to the plane's origin.
+void ncplane_center_abs(const ncplane* n, int* RESTRICT y, int* RESTRICT x){
+  ncplane_center(n, y, x);
+  if(y){
+    *y += n->absy;
+  }
+  if(x){
+    *x += n->absx;
+  }
+}
+
+int ncplane_putwstr_stained(ncplane* n, const wchar_t* gclustarr){
+  mbstate_t ps = {0};
+  const wchar_t** wset = &gclustarr;
+  size_t mbytes = wcsrtombs(NULL, wset, 0, &ps);
+  if(mbytes == (size_t)-1){
+    logerror("error converting wide string");
+    return -1;
+  }
+  ++mbytes;
+  char* mbstr = malloc(mbytes);
+  if(mbstr == NULL){
+    return -1;
+  }
+  size_t s = wcsrtombs(mbstr, wset, mbytes, &ps);
+  if(s == (size_t)-1){
+    free(mbstr);
+    return -1;
+  }
+  int r = ncplane_putstr_stained(n, mbstr);
+  free(mbstr);
+  return r;
+}
+
+int notcurses_ucs32_to_utf8(const uint32_t* ucs32, unsigned ucs32count,
+                            unsigned char* resultbuf, size_t buflen){
+  if(u32_to_u8(ucs32, ucs32count, resultbuf, &buflen) == NULL){
+    return -1;
+  }
+  return buflen;
+}
+
+int ncstrwidth(const char* egcs, int* validbytes, int* validwidth){
+  int cols;
+  if(validwidth == NULL){
+    validwidth = &cols;
+  }
+  *validwidth = 0;
+  int bytes;
+  if(validbytes == NULL){
+    validbytes = &bytes;
+  }
+  *validbytes = 0;
+  do{
+    int thesecols, thesebytes;
+    thesebytes = utf8_egc_len(egcs, &thesecols);
+    if(thesebytes < 0){
+      return -1;
+    }
+    egcs += thesebytes;
+    *validbytes += thesebytes;
+    *validwidth += thesecols;
+  }while(*egcs);
+  return *validwidth;
+}
+
+void ncplane_pixel_geom(const ncplane* n,
+                        unsigned* RESTRICT pxy, unsigned* RESTRICT pxx,
+                        unsigned* RESTRICT celldimy, unsigned* RESTRICT celldimx,
+                        unsigned* RESTRICT maxbmapy, unsigned* RESTRICT maxbmapx){
+  const notcurses* nc = ncplane_notcurses_const(n);
+  const ncpile* p = ncplane_pile_const(n);
+  if(celldimy){
+    *celldimy = p->cellpxy;
+  }
+  if(celldimx){
+    *celldimx = p->cellpxx;
+  }
+  if(pxy){
+    *pxy = p->cellpxy * ncplane_dim_y(n);
+  }
+  if(pxx){
+    *pxx = p->cellpxx * ncplane_dim_x(n);
+  }
+  if(notcurses_check_pixel_support(nc) > 0){
+    if(maxbmapy){
+      *maxbmapy = p->cellpxy * ncplane_dim_y(n);
+      if(*maxbmapy > nc->tcache.sixel_maxy && nc->tcache.sixel_maxy){
+        *maxbmapy = nc->tcache.sixel_maxy;
+      }
+    }
+    if(maxbmapx){
+      *maxbmapx = p->cellpxx * ncplane_dim_x(n);
+      if(*maxbmapx > nc->tcache.sixel_maxx && nc->tcache.sixel_maxx){
+        *maxbmapx = nc->tcache.sixel_maxx;
+      }
+    }
+  }else{
+    if(maxbmapy){
+      *maxbmapy = 0;
+    }
+    if(maxbmapx){
+      *maxbmapx = 0;
+    }
+  }
+}
+
+const nccapabilities* notcurses_capabilities(const notcurses* n){
+  return &n->tcache.caps;
 }

@@ -1,26 +1,23 @@
-bool InvalidMove() { // a bit wasteful, but piece are tiny
-  int dy, dx;
+bool InvalidMove() { // a bit wasteful, but pieces are tiny
+  unsigned dy, dx;
   curpiece_->get_dim(&dy, &dx);
   while(dy--){
     int x = dx;
     while(x--){
       ncpp::Cell c, b;
-      if(curpiece_->get_at(dy, x, &c) < 0){
-        throw TetrisNotcursesErr("get_at()");
-      }
-      if(c.is_simple()){
+      curpiece_->get_at(dy, x, &c);
+      if(strcmp(curpiece_->get_extended_gcluster(c), "") == 0){
         continue;
       }
       curpiece_->release(c);
       int transy = dy, transx = x; // need game area coordinates via translation
       curpiece_->translate(*board_, &transy, &transx);
-      if(transy < 0 || transy >= board_->get_dim_y() || transx < 0 || transx >= board_->get_dim_x()){
+      if(transy < 0 || (unsigned)transy >= board_->get_dim_y()
+          || transx < 0 || (unsigned)transx >= board_->get_dim_x()){
         return true;
       }
-      if(board_->get_at(transy, transx, &b) < 0){
-        throw TetrisNotcursesErr("get_at()");
-      }
-      if(!b.is_simple()){
+      board_->get_at(transy, transx, &b);
+      if(strcmp(board_->get_extended_gcluster(b), "")){
         return true;
       }
       board_->release(b);

@@ -1,39 +1,39 @@
 #include "demo.h"
-#include <sys/random.h>
 
-int qrcode_demo(struct notcurses* nc){
+int qrcode_demo(struct notcurses* nc, uint64_t startns){
+  (void)startns;
+  if(!notcurses_canutf8(nc)){
+    return 0;
+  }
 #ifdef USE_QRCODEGEN
   char data[128];
-  int dimy, dimx;
-  struct ncplane* n = notcurses_stddim_yx(nc, &dimy, &dimx);
+  unsigned dimy, dimx;
+  struct ncplane *stdn = notcurses_stddim_yx(nc, &dimy, &dimx);
+  ncplane_erase(stdn);
+  struct ncplane* n = ncplane_dup(stdn, NULL);
   for(int i = 0 ; i < 1024 ; ++i){
     ncplane_erase(n);
-    size_t len = random() % sizeof(data) + 1;
-    ssize_t got = getrandom(data, len, 0);
-    if(got < 0 || (size_t)got != len){
-      return -1;
+    size_t len = rand() % sizeof(data) + 1;
+    size_t done = 0;
+    // done this tedious way because getrand() doesn't exist on freebsd 11
+    while(done < len){
+      long r = rand();
+      memcpy(data + done, &r, sizeof(r));
+      done += sizeof(r);
     }
-    if(ncplane_cursor_move_yx(n, 0, 0)){
-      return -1;
+    ncplane_home(n);
+    unsigned y = dimy, x = dimx;
+    ncplane_home(n);
+    int qlen = ncplane_qrcode(n, &y, &x, data, len);
+    if(qlen > 0){ // FIXME can fail due to being too large for display; distinguish this case
+      ncplane_move_yx(n, (dimy - y) / 2, (dimx - x) / 2);
+      ncplane_home(n);
+      ncplane_set_fg_rgb8(n, rand() % 255 + 1, rand() % 255 + 1, rand() % 255 + 1); 
+      DEMO_RENDER(nc);
     }
-    if(ncplane_qrcode(n, 0, data, len) <= 0){
-      return -1;
-    }
-    if(ncplane_cursor_move_yx(n, 0, 0)){
-      return -1;
-    }
-    uint64_t tl = 0, bl = 0, br = 0, tr = 0;
-    channels_set_fg_rgb(&tl, random() % 255 + 1, random() % 255 + 1, random() % 255 + 1);
-    channels_set_fg_rgb(&tr, random() % 255 + 1, random() % 255 + 1, random() % 255 + 1);
-    channels_set_fg_rgb(&bl, random() % 255 + 1, random() % 255 + 1, random() % 255 + 1);
-    channels_set_fg_rgb(&br, random() % 255 + 1, random() % 255 + 1, random() % 255 + 1);
-    if(ncplane_stain(n, dimy - 1, dimx - 1, tl, tr, bl, br) <= 0){
-      return -1;
-    }
-    DEMO_RENDER(nc);
   }
+  ncplane_mergedown_simple(n, stdn); // leave the last one on-screen
+  ncplane_destroy(n);
 #endif
-  ncplane_erase(n);
-  DEMO_RENDER(nc);
   return 0;
 }

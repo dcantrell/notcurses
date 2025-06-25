@@ -7,8 +7,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <clocale>
+#include <getopt.h>
 #include <iostream>
-#include <termios.h>
 #include <ncpp/Plane.hh>
 #include <ncpp/NotCurses.hh>
 
@@ -27,15 +27,17 @@ using namespace ncpp;
 
 std::mutex mtx;
 uint64_t start;
-static int dimy, dimx;
 std::atomic<bool> done;
+static unsigned dimy, dimx;
 static struct ncuplot* plot;
 
 // return the string version of a special composed key
 const char* nckeystr(char32_t spkey){
   switch(spkey){ // FIXME
     case NCKEY_RESIZE:
+      mtx.lock();
       NotCurses::get_instance().refresh(&dimy, &dimx);
+      mtx.unlock();
       return "resize event";
     case NCKEY_INVALID: return "invalid";
     case NCKEY_LEFT:    return "left";
@@ -124,25 +126,60 @@ const char* nckeystr(char32_t spkey){
     case NCKEY_EXIT:    return "exit";
     case NCKEY_PRINT:   return "print";
     case NCKEY_REFRESH: return "refresh";
-    case NCKEY_BUTTON1: return "mouse (button 1 pressed)";
-    case NCKEY_BUTTON2: return "mouse (button 2 pressed)";
-    case NCKEY_BUTTON3: return "mouse (button 3 pressed)";
-    case NCKEY_BUTTON4: return "mouse (button 4 pressed)";
-    case NCKEY_BUTTON5: return "mouse (button 5 pressed)";
-    case NCKEY_BUTTON6: return "mouse (button 6 pressed)";
-    case NCKEY_BUTTON7: return "mouse (button 7 pressed)";
-    case NCKEY_BUTTON8: return "mouse (button 8 pressed)";
-    case NCKEY_BUTTON9: return "mouse (button 9 pressed)";
-    case NCKEY_BUTTON10: return "mouse (button 10 pressed)";
-    case NCKEY_BUTTON11: return "mouse (button 11 pressed)";
-    case NCKEY_RELEASE: return "mouse (button released)";
+    case NCKEY_SEPARATOR: return "separator";
+    case NCKEY_CAPS_LOCK: return "caps lock";
+    case NCKEY_SCROLL_LOCK: return "scroll lock";
+    case NCKEY_NUM_LOCK: return "num lock";
+    case NCKEY_PRINT_SCREEN: return "print screen";
+    case NCKEY_PAUSE: return "pause";
+    case NCKEY_MENU: return "menu";
+    // media keys, similarly only available through kitty's protocol
+    case NCKEY_MEDIA_PLAY: return "play";
+    case NCKEY_MEDIA_PAUSE: return "pause";
+    case NCKEY_MEDIA_PPAUSE: return "play-pause";
+    case NCKEY_MEDIA_REV: return "reverse";
+    case NCKEY_MEDIA_STOP: return "stop";
+    case NCKEY_MEDIA_FF: return "fast-forward";
+    case NCKEY_MEDIA_REWIND: return "rewind";
+    case NCKEY_MEDIA_NEXT: return "next track";
+    case NCKEY_MEDIA_PREV: return "previous track";
+    case NCKEY_MEDIA_RECORD: return "record";
+    case NCKEY_MEDIA_LVOL: return "lower volume";
+    case NCKEY_MEDIA_RVOL: return "raise volume";
+    case NCKEY_MEDIA_MUTE: return "mute";
+    case NCKEY_LSHIFT: return "left shift";
+    case NCKEY_LCTRL: return "left ctrl";
+    case NCKEY_LALT: return "left alt";
+    case NCKEY_LSUPER: return "left super";
+    case NCKEY_LHYPER: return "left hyper";
+    case NCKEY_LMETA: return "left meta";
+    case NCKEY_RSHIFT: return "right shift";
+    case NCKEY_RCTRL: return "right ctrl";
+    case NCKEY_RALT: return "right alt";
+    case NCKEY_RSUPER: return "right super";
+    case NCKEY_RHYPER: return "right hyper";
+    case NCKEY_RMETA: return "right meta";
+    case NCKEY_L3SHIFT: return "level 3 shift";
+    case NCKEY_L5SHIFT: return "level 5 shift";
+    case NCKEY_MOTION: return "mouse (no buttons pressed)";
+    case NCKEY_BUTTON1: return "mouse (button 1)";
+    case NCKEY_BUTTON2: return "mouse (button 2)";
+    case NCKEY_BUTTON3: return "mouse (button 3)";
+    case NCKEY_BUTTON4: return "mouse (button 4)";
+    case NCKEY_BUTTON5: return "mouse (button 5)";
+    case NCKEY_BUTTON6: return "mouse (button 6)";
+    case NCKEY_BUTTON7: return "mouse (button 7)";
+    case NCKEY_BUTTON8: return "mouse (button 8)";
+    case NCKEY_BUTTON9: return "mouse (button 9)";
+    case NCKEY_BUTTON10: return "mouse (button 10)";
+    case NCKEY_BUTTON11: return "mouse (button 11)";
     default:            return "unknown";
   }
 }
 
 // Print the utf8 Control Pictures for otherwise unprintable ASCII
 char32_t printutf8(char32_t kp){
-  if(kp <= 27){
+  if(kp <= NCKEY_ESC){
     return 0x2400 + kp;
   }
   return kp;
@@ -152,23 +189,22 @@ char32_t printutf8(char32_t kp){
 // older text, and thus clearly indicate the current output.
 static bool
 dim_rows(const Plane* n){
-  int y, x;
   Cell c;
-  for(y = 2 ; y < dimy ; ++y){
-    for(x = 0 ; x < dimx ; ++x){
+  for(unsigned y = 0 ; y < dimy ; ++y){
+    for(unsigned x = 0 ; x < dimx ; ++x){
       if(n->get_at(y, x, &c) < 0){
         n->release(c);
         return false;
       }
       unsigned r, g, b;
-      c.get_fg_rgb(&r, &g, &b);
+      c.get_fg_rgb8(&r, &g, &b);
       r -= r / 32;
       g -= g / 32;
       b -= b / 32;
       if(r > 247){ r = 0; }
       if(g > 247){ g = 0; }
       if(b > 247){ b = 0; }
-      if(!c.set_fg_rgb(r, g, b)){
+      if(!c.set_fg_rgb8(r, g, b)){
         n->release(c);
         return false;
       }
@@ -187,74 +223,103 @@ dim_rows(const Plane* n){
 
 void Tick(ncpp::NotCurses* nc, uint64_t sec) {
   const std::lock_guard<std::mutex> lock(mtx);
-  if(ncuplot_add_sample(plot, sec, 0)){
-    throw std::runtime_error("couldn't register timetick");
-  }
-  if(!nc->render()){
-    throw std::runtime_error("error rendering");
+  // might fail on various geometry changes
+  if(ncuplot_add_sample(plot, sec, 0) == 0){
+    if(!nc->render()){
+      throw std::runtime_error("error rendering");
+    }
   }
 }
 
 void Ticker(ncpp::NotCurses* nc) {
   do{
-    std::this_thread::sleep_for(std::chrono::seconds{1});
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
     const uint64_t sec = (timenow_to_ns() - start) / NANOSECS_IN_SEC;
     Tick(nc, sec);
   }while(!done);
 }
 
-int main(void){
+char evtype_to_char(ncinput* ni){
+  switch(ni->evtype){
+    case EvType::Unknown:
+      return 'u';
+    case EvType::Press:
+      return 'P';
+    case EvType::Repeat:
+      return 'R';
+    case EvType::Release:
+      return 'L';
+  }
+  return 'X';
+}
+
+int input_demo(ncpp::NotCurses* nc) {
   constexpr auto PLOTHEIGHT = 6;
-  if(setlocale(LC_ALL, "") == nullptr){
-    return EXIT_FAILURE;
+  constexpr auto PLOTWIDTH = 56;
+  auto n = nc->get_stdplane(&dimy, &dimx);
+  // FIXME no ncpp wrapper for Plane::pixelgeom?
+  unsigned celldimx, maxbmapx;
+  ncplane_pixel_geom(*n, nullptr, nullptr, nullptr, &celldimx, nullptr, &maxbmapx);
+  struct ncplane_options nopts = {
+    .y = static_cast<int>(dimy) - PLOTHEIGHT - 1,
+    .x = NCALIGN_CENTER,
+    .rows = PLOTHEIGHT,
+    .cols = PLOTWIDTH,
+    .userptr = nullptr,
+    .name = "plot",
+    .resizecb = ncplane_resize_realign,
+    .flags = NCPLANE_OPTION_HORALIGNED,
+    .margin_b = 0,
+    .margin_r = 0,
+  };
+  struct ncplane* pplane = ncplane_create(*n, &nopts);
+  if(pplane == nullptr){
+   return EXIT_FAILURE;
   }
-  NotCurses nc;
-  if(!nc.mouse_enable()){
-    return EXIT_FAILURE;
-  }
-  auto n = nc.get_stdplane(&dimy, &dimx);
-  ncpp::Plane pplane{PLOTHEIGHT, dimx, dimy - PLOTHEIGHT,  0, nullptr};
   struct ncplot_options popts{};
-  popts.labelaxisd = true;
-  popts.minchannel = popts.maxchannel = 0;
-  channels_set_fg_rgb(&popts.minchannel, 0x40, 0x50, 0xb0);
-  channels_set_fg_rgb(&popts.maxchannel, 0x40, 0xff, 0xd0);
-  popts.gridtype = static_cast<ncgridgeom_e>(NCPLOT_2x2);
+  // FIXME would be nice to switch over to exponential at some level
+  popts.flags = NCPLOT_OPTION_LABELTICKSD | NCPLOT_OPTION_PRINTSAMPLE;
+  popts.minchannels = popts.maxchannels = 0;
+  ncchannels_set_fg_rgb8(&popts.minchannels, 0x40, 0x50, 0xb0);
+  ncchannels_set_fg_rgb8(&popts.maxchannels, 0x40, 0xff, 0xd0);
+  popts.gridtype = static_cast<ncblitter_e>(NCBLIT_PIXEL);
   plot = ncuplot_create(pplane, &popts, 0, 0);
   if(!plot){
     return EXIT_FAILURE;
   }
-  n->set_fg(0);
-  n->set_bg(0xbb64bb);
+  n->set_fg_rgb8(0x00, 0x00, 0x00);
+  n->set_bg_rgb8(0xbb, 0x64, 0xbb);
   n->styles_on(CellStyle::Underline);
-  if(n->putstr(0, NCAlign::Center, "mash keys, yo. give that mouse some waggle! ctrl+d exits.") <= 0){
-    return EXIT_FAILURE;
+  if(n->putstr(n->get_dim_y() - 1, NCAlign::Center, "mash keys, yo. give that mouse some waggle! ctrl+d exits.") <= 0){
+    ncuplot_destroy(plot);
+    return -1;
   }
   n->styles_set(CellStyle::None);
   n->set_bg_default();
-  if(!nc.render()){
-    throw std::runtime_error("error rendering");
+  if(!nc->render()){
+    ncuplot_destroy(plot);
+    return -1;
   }
-  int y = 2;
+  unsigned y = 0;
   std::deque<wchar_t> cells;
   char32_t r;
   done = false;
   start = timenow_to_ns();
-  std::thread tid(Ticker, &nc);
+  std::thread tid(Ticker, nc);
   ncinput ni;
-  while(errno = 0, (r = nc.getc(true, &ni)) != (char32_t)-1){
+  while(errno = 0, (r = nc->get(true, &ni)) != (char32_t)-1){
     if(r == 0){ // interrupted by signal
       continue;
     }
-
-    if((r == 'D' || r == 'd') && ni.ctrl){
+    if((r == 'D' && ncinput_ctrl_p(&ni)) || r == NCKEY_EOF){
       done = true;
       tid.join();
-      return EXIT_SUCCESS;
+      ncuplot_destroy(plot);
+      return 0;
     }
-    if((r == 'L' || r == 'l') && ni.ctrl){
+    if(r == 'L' && ncinput_ctrl_p(&ni)){
       mtx.lock();
-        if(!nc.refresh(nullptr, nullptr)){
+        if(!nc->refresh(nullptr, nullptr)){
           mtx.unlock();
           break;
         }
@@ -263,32 +328,53 @@ int main(void){
     if(!n->cursor_move(y, 0)){
       break;
     }
-    n->set_fg_rgb(0xd0, 0xd0, 0xd0);
-    n->printf("%c%c%c ", ni.alt ? 'A' : 'a', ni.ctrl ? 'C' : 'c',
-              ni.shift ? 'S' : 's');
+    n->set_fg_rgb8(0xd0, 0xd0, 0xd0);
+    n->printf("%c%c%c%c%c%c%c%c%c ",
+              ncinput_shift_p(&ni) ? 'S' : 's',
+              ncinput_alt_p(&ni) ? 'A' : 'a',
+              ncinput_ctrl_p(&ni) ? 'C' : 'c',
+              ncinput_super_p(&ni) ? 'U' : 'u',
+              ncinput_hyper_p(&ni) ? 'H' : 'h',
+              ncinput_meta_p(&ni) ? 'M' : 'm',
+              ncinput_capslock_p(&ni) ? 'X' : 'x',
+              ncinput_numlock_p(&ni) ? '#' : '.',
+              evtype_to_char(&ni));
     if(r < 0x80){
-      n->set_fg_rgb(128, 250, 64);
+      n->set_fg_rgb8(128, 250, 64);
       if(n->printf("ASCII: [0x%02x (%03d)] '%lc'", r, r,
-                   (wchar_t)(iswprint(r) ? r : printutf8(r))) < 0){
+                   (wint_t)(iswprint(r) ? r : printutf8(r))) < 0){
         break;
       }
     }else{
-      if(nckey_supppuab_p(r)){
-        n->set_fg_rgb(250, 64, 128);
-        if(n->printf("Special: [0x%02x (%02d)] '%s'",
-                     r, r, nckeystr(r)) < 0){
+      if(nckey_synthesized_p(r)){
+        n->set_fg_rgb8(250, 64, 128);
+        if(n->printf("Special: [0x%02x (%02d)] '%s'", r, r, nckeystr(r)) < 0){
           break;
         }
         if(NCKey::IsMouse(r)){
-          if(n->printf(-1, NCAlign::Right, " x: %d y: %d",
-                       ni.x, ni.y) < 0){
+          if(n->printf(-1, NCAlign::Right, " %d/%d", ni.x, ni.y) < 0){
             break;
           }
         }
       }else{
-        n->set_fg_rgb(64, 128, 250);
-        n->printf("Unicode: [0x%08x] '%lc'", r, (wchar_t)r);
+        n->set_fg_rgb8(64, 128, 250);
+        n->printf("Unicode: [0x%08x] '%s'", r, ni.utf8);
       }
+    }
+    if(ni.eff_text[0] != ni.id || ni.eff_text[1] != 0){
+      n->printf(" effective text '");
+      for (int c=0; ni.eff_text[c]!=0; c++){
+        unsigned char egc[5]={0};
+        if(notcurses_ucs32_to_utf8(&ni.eff_text[c], 1, egc, 4)>=0){
+          n->printf("%s", egc);
+        }
+      }
+      n->printf("'");
+    }
+    unsigned x;
+    n->get_cursor_yx(nullptr, &x);
+    for(unsigned i = x ; i < n->get_dim_x() ; ++i){
+      n->putc(' ');
     }
     if(!dim_rows(n)){
       break;
@@ -299,13 +385,14 @@ int main(void){
       mtx.unlock();
       break;
     }
-    if(!nc.render()){
+    if(!nc->render()){
       mtx.unlock();
+      ncuplot_destroy(plot);
       throw std::runtime_error("error rendering");
     }
     mtx.unlock();
-    if(++y >= dimy - PLOTHEIGHT){ // leave six lines free on the bottom...
-      y = 2;                      // ...and one free on the top.
+    if(++y >= dimy - PLOTHEIGHT - 1){
+      y = 0;
     }
     while(cells.size() >= dimy - 3u){
       cells.pop_back();
@@ -318,6 +405,55 @@ int main(void){
   }
   done = true;
   tid.join();
-  nc.stop();
-  return EXIT_FAILURE;
+  ncuplot_destroy(plot);
+  return 0;
+}
+
+static void
+usage(const char* arg0, FILE* fp){
+  fprintf(fp, "usage: %s [ -v ] [ -m ]\n", arg0);
+  if(fp == stderr){
+    exit(EXIT_FAILURE);
+  }
+  exit(EXIT_SUCCESS);
+}
+
+int main(int argc, char** argv){
+  if(setlocale(LC_ALL, "") == nullptr){
+    return EXIT_FAILURE;
+  }
+  notcurses_options nopts{};
+  nopts.margin_t = 2;
+  nopts.margin_l = 2;
+  nopts.margin_r = 2;
+  nopts.margin_b = 2;
+  nopts.loglevel = NCLOGLEVEL_ERROR;
+  bool nomice = false;
+  int opt;
+  while((opt = getopt(argc, argv, "vm")) != -1){
+    switch(opt){
+      case 'm':
+        nomice = true;
+        break;
+      case 'v':
+        nopts.loglevel = NCLOGLEVEL_TRACE;
+        break;
+      default:
+        usage(argv[0], stderr);
+        break;
+    }
+  }
+  if(argv[optind]){ // non-option argument was provided
+    usage(argv[0], stderr);
+  }
+  nopts.flags = NCOPTION_INHIBIT_SETLOCALE;
+  NotCurses nc(nopts);
+  if(!nomice){
+    nc.mouse_enable(NCMICE_ALL_EVENTS);
+  }
+  int ret = input_demo(&nc);
+  if(!nc.stop() || ret){
+    return EXIT_FAILURE;
+  }
+  return EXIT_SUCCESS;
 }

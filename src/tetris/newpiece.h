@@ -10,32 +10,28 @@ std::unique_ptr<ncpp::Plane> NewPiece() {
   } tetriminos[] = { // OITLJSZ
     { 0xcbc900, "****"}, { 0x009caa, "    ****"}, { 0x952d98, " * ***"}, { 0xcf7900, "  ****"},
     { 0x0065bd, "*  ***"},   { 0x69be28, " **** "}, { 0xbd2939, "**  **"} };
-  const int tidx = random() % 7;
+  const int tidx = rand() % 7;
   const struct tetrimino* t = &tetriminos[tidx];
   const size_t cols = strlen(t->texture);
-  int y, x;
+  unsigned y, x;
   stdplane_->get_dim(&y, &x);
-  const int xoff = x / 2 - BOARD_WIDTH + 2 * (random() % (BOARD_WIDTH / 2));
+  const int xoff = x / 2 - BOARD_WIDTH + 2 * (rand() % (BOARD_WIDTH / 2));
   std::unique_ptr<ncpp::Plane> n = std::make_unique<ncpp::Plane>(2, cols, board_top_y_ - 1, xoff, nullptr);
   if(n){
     uint64_t channels = 0;
-    channels_set_bg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
-    channels_set_fg_alpha(&channels, CELL_ALPHA_TRANSPARENT);
-    n->set_fg(t->color);
-    n->set_bg_alpha(CELL_ALPHA_TRANSPARENT);
+    ncchannels_set_bg_alpha(&channels, NCALPHA_TRANSPARENT);
+    ncchannels_set_fg_alpha(&channels, NCALPHA_TRANSPARENT);
+    n->set_fg_rgb(t->color);
+    n->set_bg_alpha(NCALPHA_TRANSPARENT);
     n->set_base("", 0, channels);
     y = 0; x = 0;
     for(size_t i = 0 ; i < strlen(t->texture) ; ++i){
       if(t->texture[i] == '*'){
-        if(n->putstr(y, x, "██") < 0){
-          throw TetrisNotcursesErr("putstr()");
-        }
+        n->putstr(y, x, "██");
       }
       y += ((x = ((x + 2) % cols)) == 0);
     }
   }
-  if(!nc_.render()){
-    throw TetrisNotcursesErr("render()");
-  }
+  nc_.render();
   return n;
 }

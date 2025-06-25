@@ -7,6 +7,7 @@
 
 namespace ncpp
 {
+	class NotCurses;
 	class Plane;
 
 	class NCPP_API_EXPORT Menu : public Root
@@ -15,11 +16,12 @@ namespace ncpp
 		static ncmenu_options default_options;
 
 	public:
-		explicit Menu (const ncmenu_options *opts = nullptr)
+		explicit Menu (const ncmenu_options *opts = nullptr, NotCurses *ncinst = nullptr)
+			: Root (ncinst)
 		{
-			menu = ncmenu_create (get_notcurses (), opts == nullptr ? &default_options : opts);
+			menu = ncmenu_create (notcurses_stdplane (get_notcurses ()), opts == nullptr ? &default_options : opts);
 			if (menu == nullptr)
-				throw init_error ("notcurses failed to create a new menu");
+				throw init_error ("Notcurses failed to create a new menu");
 		}
 
 		~Menu ()
@@ -58,14 +60,24 @@ namespace ncpp
 			return error_guard (ncmenu_previtem (menu), -1);
 		}
 
+		bool item_set_status (const char* section, const char* item, bool status) const NOEXCEPT_MAYBE
+		{
+			return error_guard (ncmenu_item_set_status (menu, section, item, status), -1);
+		}
+
 		const char* get_selected (ncinput *ni = nullptr) const noexcept
 		{
 			return ncmenu_selected (menu, ni);
 		}
 
-		bool offer_input (const struct ncinput* nc) const noexcept
+		const char* get_mouse_selected (const struct ncinput* click, struct ncinput* ni) const noexcept
 		{
-			return ncmenu_offer_input (menu, nc);
+			return ncmenu_mouse_selected (menu, click, ni);
+		}
+
+		bool offer_input (const struct ncinput* ni) const noexcept
+		{
+			return ncmenu_offer_input (menu, ni);
 		}
 
 		Plane* get_plane () const noexcept;

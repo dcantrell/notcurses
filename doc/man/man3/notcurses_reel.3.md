@@ -1,6 +1,6 @@
 % notcurses_reel(3)
 % nick black <nickblack@linux.com>
-% v1.3.3
+% v3.0.16
 
 # NAME
 
@@ -11,36 +11,14 @@ notcurses_reel - high-level widget for hierarchical data
 **#include <notcurses/notcurses.h>**
 
 ```c
+#define NCREEL_OPTION_INFINITESCROLL 0x0001
+#define NCREEL_OPTION_CIRCULAR       0x0002
+
+struct ncreel;
+struct ncplane;
+struct nctablet;
+
 typedef struct ncreel_options {
-  // require this many rows and columns (including borders).
-  // otherwise, a message will be displayed stating that a
-  // larger terminal is necessary, and input will be queued.
-  // if 0, no minimum will be enforced. may not be negative.
-  // note that ncreel_create() does not return error if
-  // given a WINDOW smaller than these minima; it instead
-  // patiently waits for the screen to get bigger.
-  int min_supported_cols;
-  int min_supported_rows;
-
-  // use no more than this many rows and columns (including
-  // borders). may not be less than the corresponding minimum.
-  // 0 means no maximum.
-  int max_supported_cols;
-  int max_supported_rows;
-
-  // desired offsets within the surrounding WINDOW (top right
-  // bottom left) upon creation / resize. an ncreel_move()
-  // operation updates these.
-  int toff, roff, boff, loff;
-  // is scrolling infinite (can one move down or up forever, or is
-  // an end reached?). if true, 'circular' specifies how to handle
-  // the special case of an incompletely-filled reel.
-  bool infinitescroll;
-  // is navigation circular (does moving down from the last panel
-  // move to the first, and vice versa)? only meaningful when
-  // infinitescroll is true. if infinitescroll is false, this must
-  // be false.
-  bool circular;
   // notcurses can draw a border around the ncreel, and also
   // around the component tablets. inhibit borders by setting all
   // valid bits in the masks. partially inhibit borders by setting
@@ -53,46 +31,110 @@ typedef struct ncreel_options {
   unsigned tabletmask; // bitfield for tablet borders
   uint64_t tabletchan; // tablet border styling channel
   uint64_t focusedchan;// focused tablet border styling channel
-  uint64_t bgchannel;  // background colors
+  uint64_t flags;      // bitfield over NCREEL_OPTION_*
 } ncreel_options;
 ```
 
-**struct ncreel* ncreel_create(struct ncplane* nc, const ncreel_options* popts, int efd);**
+**struct ncreel* ncreel_create(struct ncplane* ***nc***, const ncreel_options* ***popts***);**
 
-**struct ncplane* ncreel_plane(struct ncreel* nr);**
+**struct ncplane* ncreel_plane(struct ncreel* ***nr***);**
 
-**typedef int (*tabletcb)(struct nctablet* t, int begx, int begy, int maxx, int maxy, bool cliptop);**
+**typedef int (*tabletcb)(struct nctablet* ***t***, bool ***cliptop***);**
 
-**struct nctablet* ncreel_add(struct ncreel* nr, struct nctablet* after, struct nctablet* before, tabletcb cb, void* opaque);**
+**struct nctablet* ncreel_add(struct ncreel* ***nr***, struct nctablet* ***after***, struct nctablet* ***before***, tabletcb ***cb***, void* ***opaque***);**
 
-**int ncreel_tabletcount(const struct ncreel* nr);**
+**int ncreel_tabletcount(const struct ncreel* ***nr***);**
 
-**int ncreel_touch(struct ncreel* nr, struct nctablet* t);**
+**int ncreel_del(struct ncreel* ***nr***, struct nctablet* ***t***);**
 
-**int ncreel_del(struct ncreel* nr, struct nctablet* t);**
+**int ncreel_redraw(struct ncreel* ***nr***);**
 
-**int ncreel_del_focused(struct ncreel* nr);**
+**struct nctablet* ncreel_focused(struct ncreel* ***nr***);**
 
-**int ncreel_move(struct ncreel* nr, int x, int y);**
+**struct nctablet* ncreel_next(struct ncreel* ***nr***);**
 
-**int ncreel_redraw(struct ncreel* nr);**
+**struct nctablet* ncreel_prev(struct ncreel* ***nr***);**
 
-**struct nctablet* ncreel_focused(struct ncreel* nr);**
+**bool ncreel_offer_input(struct ncreel* ***nr***, const ncinput* ***ni***);**
 
-**struct nctablet* ncreel_next(struct ncreel* nr);**
+**void ncreel_destroy(struct ncreel* ***nr***);**
 
-**struct nctablet* ncreel_prev(struct ncreel* nr);**
+**void* nctablet_userptr(struct nctablet* ***t***);**
 
-**int ncreel_destroy(struct ncreel* nr);**
-
-**void* nctablet_userptr(struct nctablet* t);**
-
-**struct ncplane* nctablet_ncplane(struct nctablet* t);**
+**struct ncplane* nctablet_plane(struct nctablet* ***t***);**
 
 # DESCRIPTION
 
+An **ncreel** is a widget for display and manipulation of hierarchical data,
+intended to make effective use of the display area while supporting keyboards,
+mice, and haptic interfaces. A series of **nctablet**s are ordered on a
+virtual cylinder; the tablets can grow and shrink freely. Moving among the
+tablets "spins" the cylinder. **ncreel**s support optional borders around
+the reel and/or tablets.
+
+**ncreel_redraw** arranges the tablets, invoking the **tabletcb** defined by
+each. It will invoke the callbacks of only those tablets currently visible.
+This function ought be called whenever the data within a tablet need be
+refreshed. The return value of this callback is the number of lines drawn into
+the **ncplane**. The tablet will be grown or shrunk as necessary to reflect
+this return value.
+
+Unless the reel is devoid of tablets, there is always a "focused" tablet (the
+first tablet added to an empty reel becomes focused). The focused tablet can
+change via **ncreel_next** and **ncreel_prev**. If **ncreel_del** is called on
+the focused tablet, and at least one other tablet remains, some tablet receives
+the focus.
+
+Calling functions which change the reel, including **ncreel_next**,
+**ncreel_prev**, **ncreel_del**, and **ncreel_add**, implicitly calls
+**ncreel_redraw**. This behavior **must not be relied upon**, as it is likely
+to go away.
+
+## LAYOUT
+
+When the user invokes **ncreel_redraw**, Notcurses can't assume it knows the
+size of any tablets--one or more might have changed since the last draw. Only
+after a callback does **ncreel_redraw** know how many rows a tablet will
+occupy.
+
+A redraw operation starts with the focused tablet. Its callback is invoked with
+a plane as large as the reel, i.e. the focused tablet can occupy the entire
+reel, to the exclusion of any other tablets. The focused tablet will be kept
+where it was, if possible; growth might force it to move. There is now one
+tablet locked into place, and zero, one, or two areas of empty space. Tablets
+are successively lain out in these spaces until the reel is filled.
+
+In general, if the reel is not full, tablets will be drawn towards the top, but
+this ought not be relied on.
+
+## THE TABLET CALLBACK
+
+The tablet callback (of type **tabletcb**) is called with an **ncplane** and a
+**bool**. The callback function ought not rely on the absolute position of the
+plane, as it might be moved. The **bool** indicates whether the plane ought be
+filled in from the bottom, or from the top (this is only meaningful if the
+plane is insufficiently large to contain all the tablet's available data). The
+callback ought not resize the plane (it will be resized following return). The
+callback must return the number of rows used (it is perfectly valid to use zero
+rows), or a negative number if there was an error.
+
+Returning more rows than the plane has available is an error.
+
 # RETURN VALUES
+
+**ncreel_focused**, **ncreel_prev**, and **ncreel_next** all return the focused
+tablet, unless no tablets exist, in which case they return **NULL**.
+
+**ncreel_add** returns the newly-added **nctablet**.
+
+# BUGS
+
+I can't decide whether to require the user to explicitly call **ncreel_redraw**.
+Doing so means changes can be batched up without a redraw, but it also makes
+things more complicated for both me and the user.
 
 # SEE ALSO
 
-**notcurses(3)**, **notcurses_ncplane(3)**
+**notcurses(3)**,
+**notcurses_input(3)**,
+**notcurses_plane(3)**
